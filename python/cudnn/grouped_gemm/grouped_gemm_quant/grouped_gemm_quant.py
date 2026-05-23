@@ -565,7 +565,7 @@ class BlockScaledMoEGroupedGemmQuantKernel:
         norm_const_tensor: Optional[cute.Tensor],
         padded_offsets: cute.Tensor,
         alpha: cute.Tensor,
-        per_token_scale: Optional[cute.Tensor],
+        row_scale: Optional[cute.Tensor],
         bias: Optional[cute.Tensor],
         prob: cute.Tensor,
         max_active_clusters: cutlass.Constexpr,
@@ -864,7 +864,7 @@ class BlockScaledMoEGroupedGemmQuantKernel:
             amax_tensor,
             padded_offsets,
             alpha,
-            per_token_scale,
+            row_scale,
             bias,
             prob,
             workspace_ptr,
@@ -1099,7 +1099,7 @@ class BlockScaledMoEGroupedGemmQuantKernel:
         mAmax_tensor: Optional[cute.Tensor],
         padded_offsets: cute.Tensor,
         alpha: cute.Tensor,
-        per_token_scale: Optional[cute.Tensor],
+        row_scale: Optional[cute.Tensor],
         mBias_nl: Optional[cute.Tensor],
         prob: cute.Tensor,
         workspace_ptr,
@@ -1814,14 +1814,18 @@ class BlockScaledMoEGroupedGemmQuantKernel:
                 real_prob, _ = epi_ext.get_gmem_tensor("prob", prob, padded_offsets, epi_work_tile_info)
                 mProb = real_prob[mPosition, 0, 0]
                 acc_scale = cutlass.Float32(alpha_val)
-                if cutlass.const_expr(per_token_scale is not None):
-                    real_per_token_scale, _ = epi_ext.get_gmem_tensor(
-                        "per_token_scale",
-                        per_token_scale,
+                # Row-scaled NVFP4 integrations, also called 1D2D in
+                # block-scaled FP8 convention, provide one global scale per
+                # output row. The caller folds the tensor-scaled operand's
+                # global scale into the same row multiplier.
+                if cutlass.const_expr(row_scale is not None):
+                    real_row_scale, _ = epi_ext.get_gmem_tensor(
+                        "row_scale",
+                        row_scale,
                         padded_offsets,
                         epi_work_tile_info,
                     )
-                    acc_scale = acc_scale * real_per_token_scale[mPosition]
+                    acc_scale = acc_scale * real_row_scale[mPosition]
 
                 # C1 fix: phase-based acc stage indexing for overlapping_accum
                 if cutlass.const_expr(self.overlapping_accum):

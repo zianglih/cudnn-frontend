@@ -88,8 +88,8 @@ def _check_ref_grouped_gemm_quant_discrete(inputs, outputs, cfg, skip_ref=False)
     )
 
 
-def _add_per_token_scale(inputs):
-    inputs["per_token_scale_tensor"] = torch.empty(
+def _add_row_scale(inputs):
+    inputs["row_scale_tensor"] = torch.empty(
         inputs["tensor_m"],
         dtype=torch.float32,
         device=inputs["a_tensor"].device,
@@ -412,9 +412,9 @@ def test_grouped_gemm_quant_compile_execute_rectangular_zero_alpha(request):
 @pytest.mark.L0
 @torch_fork_set_rng(seed=3)
 @pytest.mark.parametrize("vector_f32", [False, True])
-def test_grouped_gemm_quant_compile_execute_fp4_per_token_scale(vector_f32, request):
+def test_grouped_gemm_quant_compile_execute_fp4_row_scale(vector_f32, request):
     def input_mutator(inputs, _cfg):
-        _add_per_token_scale(inputs)
+        _add_row_scale(inputs)
         inputs["prob_tensor"].fill_(1.0)
 
     _test_grouped_gemm_quant_compile_execute(
@@ -436,9 +436,9 @@ def test_grouped_gemm_quant_compile_execute_fp4_per_token_scale(vector_f32, requ
 
 @pytest.mark.L0
 @torch_fork_set_rng(seed=4)
-def test_grouped_gemm_quant_wrapper_fp4_per_token_scale_with_bias(request):
+def test_grouped_gemm_quant_wrapper_fp4_row_scale_with_bias(request):
     def input_mutator(inputs, _cfg):
-        _add_per_token_scale(inputs)
+        _add_row_scale(inputs)
         inputs["prob_tensor"].uniform_(0.25, 1.25)
         inputs["bias_ref"] = inputs["bias_tensor"]
 
@@ -465,7 +465,7 @@ def test_grouped_gemm_quant_wrapper_fp4_per_token_scale_with_bias(request):
 
 @pytest.mark.L0
 @torch_fork_set_rng(seed=5)
-def test_grouped_gemm_quant_discrete_wrapper_fp4_per_token_scale(request):
+def test_grouped_gemm_quant_discrete_wrapper_fp4_row_scale(request):
     _test_grouped_gemm_quant_discrete_wrapper(
         ab_dtype=torch.float4_e2m1fn_x2,
         c_dtype=torch.bfloat16,
@@ -480,7 +480,7 @@ def test_grouped_gemm_quant_discrete_wrapper_fp4_per_token_scale(request):
         vector_f32=False,
         discrete_col_sfd=False,
         request=request,
-        per_token_scale=True,
+        row_scale=True,
     )
 
 
@@ -1019,7 +1019,7 @@ def _test_grouped_gemm_quant_compile_execute(
         sample_amax=outputs.get("amax_tensor"),
         sample_norm_const=inputs.get("norm_const_tensor"),
         sample_prob=inputs["prob_tensor"],
-        sample_per_token_scale=inputs.get("per_token_scale_tensor"),
+        sample_row_scale=inputs.get("row_scale_tensor"),
         acc_dtype=cfg["acc_dtype"],
         mma_tiler_mn=cfg["mma_tiler_mn"],
         cluster_shape_mn=cfg["cluster_shape_mn"],
@@ -1049,7 +1049,7 @@ def _test_grouped_gemm_quant_compile_execute(
         sfd_col_tensor=outputs.get("sfd_col_tensor"),
         norm_const_tensor=inputs.get("norm_const_tensor"),
         prob_tensor=inputs["prob_tensor"],
-        per_token_scale_tensor=inputs.get("per_token_scale_tensor"),
+        row_scale_tensor=inputs.get("row_scale_tensor"),
         amax_tensor=outputs.get("amax_tensor"),
         current_stream=stream,
     )
@@ -1133,7 +1133,7 @@ def _test_grouped_gemm_quant_wrapper(
                 alpha_tensor=inputs["alpha_tensor"],
                 norm_const_tensor=inputs.get("norm_const_tensor"),
                 prob_tensor=inputs["prob_tensor"],
-                per_token_scale_tensor=inputs.get("per_token_scale_tensor"),
+                row_scale_tensor=inputs.get("row_scale_tensor"),
                 acc_dtype=cfg["acc_dtype"],
                 d_dtype=cfg["d_dtype"],
                 cd_major=cfg["cd_major"],
@@ -1237,7 +1237,7 @@ def _test_grouped_gemm_quant_discrete_compile_execute(
         sample_amax=outputs.get("amax_tensor"),
         sample_norm_const=inputs.get("norm_const_tensor"),
         sample_prob=inputs["prob_tensor"],
-        sample_per_token_scale=inputs.get("per_token_scale_tensor"),
+        sample_row_scale=inputs.get("row_scale_tensor"),
         acc_dtype=cfg["acc_dtype"],
         mma_tiler_mn=cfg["mma_tiler_mn"],
         cluster_shape_mn=cfg["cluster_shape_mn"],
@@ -1269,7 +1269,7 @@ def _test_grouped_gemm_quant_discrete_compile_execute(
         amax_tensor=outputs.get("amax_tensor"),
         norm_const_tensor=inputs.get("norm_const_tensor"),
         prob_tensor=inputs["prob_tensor"],
-        per_token_scale_tensor=inputs.get("per_token_scale_tensor"),
+        row_scale_tensor=inputs.get("row_scale_tensor"),
         current_stream=stream,
     )
 
@@ -1297,7 +1297,7 @@ def _test_grouped_gemm_quant_discrete_wrapper(
     discrete_col_sfd,
     request,
     use_dynamic_sched=False,
-    per_token_scale=False,
+    row_scale=False,
 ):
     try:
         from cudnn import grouped_gemm_quant_wrapper_sm100
@@ -1334,8 +1334,8 @@ def _test_grouped_gemm_quant_discrete_wrapper(
         m_aligned=cfg["m_aligned"],
         b_major=cfg["b_major"],
     )
-    if per_token_scale:
-        _add_per_token_scale(inputs)
+    if row_scale:
+        _add_row_scale(inputs)
 
     try:
         for _ in range(2):
@@ -1351,7 +1351,7 @@ def _test_grouped_gemm_quant_discrete_wrapper(
                 b_major=cfg["b_major"],
                 norm_const_tensor=inputs.get("norm_const_tensor"),
                 prob_tensor=inputs["prob_tensor"],
-                per_token_scale_tensor=inputs.get("per_token_scale_tensor"),
+                row_scale_tensor=inputs.get("row_scale_tensor"),
                 acc_dtype=cfg["acc_dtype"],
                 d_dtype=cfg["d_dtype"],
                 cd_major=cfg["cd_major"],

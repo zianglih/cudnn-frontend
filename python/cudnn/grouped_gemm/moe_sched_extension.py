@@ -102,7 +102,7 @@ class DiscreteWeightScaledGemmSchedExtension(MoESchedExtension):
     with GLU and quantization fusion.
 
     Handles domain conversion for: a, b, c, d, d_col, prob, dprob,
-    per_token_scale, sfa, sfd, sfd_col, sfb.
+    row_scale, sfa, sfd, sfd_col, sfb.
 
     B and SFB are discrete (per-expert pointer arrays) → use expert-wise
     TMA descriptors from workspace.
@@ -181,7 +181,7 @@ class DiscreteWeightScaledGemmSchedExtension(MoESchedExtension):
             real = rewrite_tensor_shape(real, (shape[0], c1))
             return (real, None)
 
-        elif cutlass.const_expr(tensor_name == "per_token_scale"):
+        elif cutlass.const_expr(tensor_name == "row_scale"):
             real = cute.domain_offset((token_offset,), gmem_tensor_in_moe_view)
             real = rewrite_tensor_shape(real, (tokens_i,))
             return (real, None)
@@ -304,7 +304,7 @@ class ContiguousAndConsistentGroupedGemmSchedExtension(MoESchedExtension):
             real = rewrite_tensor_shape(real, (shape[0], c1))
             return (real, None)
 
-        elif cutlass.const_expr(tensor_name == "per_token_scale"):
+        elif cutlass.const_expr(tensor_name == "row_scale"):
             real = cute.domain_offset((token_offset,), gmem_tensor_in_moe_view)
             real = rewrite_tensor_shape(real, (tokens_i,))
             return (real, None)
