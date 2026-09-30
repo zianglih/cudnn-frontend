@@ -144,8 +144,7 @@ class PackGQA:
     @cute.jit
     def load_Weights_packed(
         self,
-        base_ptr_i64: cutlass.Int64,
-        seqlen_q: cutlass.Int32,
+        weights: cute.Tensor,  # ((H, S_q),), native element type and strides
         sWeights: cute.Tensor,  # (tile_m,) - SMEM buffer
         m_block: cutlass.Int32,
         tile_m: cutlass.Constexpr[int],
@@ -160,28 +159,18 @@ class PackGQA:
                 idx = m_block * tile_m + row
                 m_idx = idx // qhpkv
                 h_idx = idx - m_idx * qhpkv
-                ptr = sm90_ops.elem_pointer_packed_i64(
-                    base_ptr_i64,
-                    h_idx,
-                    m_idx,
-                    seqlen_q,
-                    cutlass.BFloat16,
-                    cute.AddressSpace.gmem,  # Weights use bf16.
-                )
-                gmem_val = cute.make_tensor(ptr, (1,))
-                sWeights[row] = gmem_val[0]
+                sWeights[row] = weights[((cutlass.Int64(h_idx), cutlass.Int64(m_idx)),)]
 
     @cute.jit
     def load_Weights_packed_f32(
         self,
-        base_ptr_i64: cutlass.Int64,
-        seqlen_q: cutlass.Int32,
+        weights: cute.Tensor,  # ((H, S_q),), native element type and strides
         sWeights: cute.Tensor,  # (tile_m,) - FP32 SMEM buffer
         m_block: cutlass.Int32,
         tile_m: cutlass.Constexpr[int],
         tidx: cutlass.Int32,  # 0-31 for Warp 0
     ):
-        """Load BF16 weights from packed global memory and convert once to FP32 SMEM."""
+        """Load native BF16/FP32 weights into FP32 SMEM."""
         qhpkv = self.qhead_per_kvhead
         rows_per_thread = cute.ceil_div(tile_m, cute.arch.WARP_SIZE)
         for i in cutlass.range_constexpr(rows_per_thread):
@@ -190,13 +179,4 @@ class PackGQA:
                 idx = m_block * tile_m + row
                 m_idx = idx // qhpkv
                 h_idx = idx - m_idx * qhpkv
-                ptr = sm90_ops.elem_pointer_packed_i64(
-                    base_ptr_i64,
-                    h_idx,
-                    m_idx,
-                    seqlen_q,
-                    cutlass.BFloat16,
-                    cute.AddressSpace.gmem,
-                )
-                gmem_val = cute.make_tensor(ptr, (1,))
-                sWeights[row] = cutlass.Float32(gmem_val[0])
+                sWeights[row] = cutlass.Float32(weights[((cutlass.Int64(h_idx), cutlass.Int64(m_idx)),)])

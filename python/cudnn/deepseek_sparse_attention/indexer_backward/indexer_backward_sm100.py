@@ -514,6 +514,8 @@ class IndexerBackwardSm100:
     ):
         self.q_dtype = mQ.element_type
         self.k_dtype = mK.element_type
+        self.w_dtype = mW.element_type
+        self.dw_dtype = mdW.element_type
 
         # Q/W/dQ/dW/GradSignal/TopkIdx: transpose (bs, seqlen, ...) → (seqlen, ..., bs)
         mQ = cute.make_tensor(mQ.iterator, cute.select(mQ.layout, mode=[1, 2, 3, 0]))
@@ -785,7 +787,7 @@ class IndexerBackwardSm100:
             sdS: cute.struct.Align[cute.struct.MemRange[self.q_dtype, sdS_size], self.buffer_align_bytes]
             sGradSignal: cute.struct.Align[cute.struct.MemRange[Float32, _grad_storage_size], 128]
             sTopkIdxs: cute.struct.Align[cute.struct.MemRange[Int32, smem_topk_capacity], 128]
-            sW: cute.struct.Align[cute.struct.MemRange[self.q_dtype, _weight_storage_size], 128]
+            sW: cute.struct.Align[cute.struct.MemRange[self.w_dtype, _weight_storage_size], 128]
             sdKStage: cute.struct.Align[cute.struct.MemRange[Float32, _dk_stage_elements], 128]
             sdQEpilogue: cute.struct.Align[
                 cute.struct.MemRange[self.q_dtype, _dq_epi_storage_size],
@@ -2784,7 +2786,7 @@ class IndexerBackwardSm100:
 
         # For the production 64x128 accumulator and 16dp256b8x ownership,
         # every thread visits exactly two heads. Hoist those two conversions
-        # instead of reloading BF16 weights for every score pair.
+        # instead of reloading weights for every score pair.
         if const_expr(use_stmatrix_ds):
             h_base = warp_id_in_wg * 16 + lane_id // 4
             weight_lo = Float32(sW[h_base])
@@ -3027,8 +3029,8 @@ class IndexerBackwardSm100:
             )
             if lane_id % 4 == 0:
                 h0 = warp_id_in_wg * 16 + lane_id // 4
-                mdW[seq_idx, h0, batch_idx] = self.q_dtype(sum_low)
-                mdW[seq_idx, h0 + 8, batch_idx] = self.q_dtype(sum_high)
+                mdW[seq_idx, h0, batch_idx] = self.dw_dtype(sum_low)
+                mdW[seq_idx, h0 + 8, batch_idx] = self.dw_dtype(sum_high)
         else:
             HEADS_PER_WARP = const_expr(self.heads_padded // 4)
             warp_base_h = warp_id_in_wg * Int32(HEADS_PER_WARP)
@@ -3044,7 +3046,7 @@ class IndexerBackwardSm100:
                         my_partial = my_partial + dw_accum[ei]
                 total = cute.arch.warp_reduction_sum(my_partial)
                 if lane_id == 0:
-                    mdW[seq_idx, h, batch_idx] = self.q_dtype(total)
+                    mdW[seq_idx, h, batch_idx] = self.dw_dtype(total)
 
     # =========================================================================
     # Warps 12-15: Reduce warpgroup (wide dK T2R + bulk FP32 reduce, 2-stage)
@@ -3834,7 +3836,7 @@ def _build_cute_dsl_kernel(
 
     def _ensure_compiled(IndexQ, Weights, IndexK, dIndexQ, dWeights, dIndexK_f32, AttnScore, TopkIndices, enable_score_pdl: bool, current_stream=None):
         """Lazy-compile the GEMM kernel (kernel 2)."""
-        compile_key = (*compile_key_base, enable_score_pdl)
+        compile_key = (*compile_key_base, Weights.dtype, dWeights.dtype, enable_score_pdl)
         if compile_key not in _compile_cache:
             s = _resolve_stream(current_stream)
             cute_args = [to_cute_tensor(t) for t in [IndexQ, Weights, IndexK, dIndexQ, dWeights, dIndexK_f32, AttnScore, TopkIndices]]
@@ -3845,6 +3847,8 @@ def _build_cute_dsl_kernel(
                 s,
                 options=compile_options("--opt-level 2"),
             )
+
+        return _compile_cache[compile_key]
 
     def _run_gemm(
         IndexQ,
@@ -3859,10 +3863,11 @@ def _build_cute_dsl_kernel(
         current_stream=None,
     ):
         s = _resolve_stream(current_stream)
-        compile_key = (*compile_key_base, enable_score_pdl)
-        _ensure_compiled(IndexQ, Weights, IndexK, dIndexQ, dWeights, dIndexK_f32, GradSignal, TopkIndices, enable_score_pdl, current_stream=current_stream)
+        kernel = _ensure_compiled(
+            IndexQ, Weights, IndexK, dIndexQ, dWeights, dIndexK_f32, GradSignal, TopkIndices, enable_score_pdl, current_stream=current_stream
+        )
         with torch.cuda.nvtx.range("indexer_backward_dsl_gemm"):
-            _compile_cache[compile_key](
+            kernel(
                 IndexQ,
                 Weights,
                 IndexK,

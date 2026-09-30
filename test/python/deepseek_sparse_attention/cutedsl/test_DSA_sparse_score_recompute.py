@@ -12,7 +12,7 @@ from deepseek_sparse_attention.cutedsl.dsa_utils import dsa_init, with_dsa_spars
 from deepseek_sparse_attention.cutedsl.dsa_reference import check_ref_sparse_score_recompute
 
 
-def _allocate(cfg, score_type: str, has_topk_length: bool):
+def _allocate(cfg, score_type: str, has_topk_length: bool, weights_dtype=torch.bfloat16):
     b = cfg["b"]
     s_q = cfg["s_q"]
     s_k = cfg["s_kv"]
@@ -38,7 +38,7 @@ def _allocate(cfg, score_type: str, has_topk_length: bool):
         topk_indices = topk_indices.masked_fill(positions >= topk_length.unsqueeze(-1), -1)
 
     if score_type == "indexer":
-        weights = torch.randn(b, s_q, qhpkv, dtype=torch.bfloat16, device=device)
+        weights = torch.randn(b, s_q, qhpkv, dtype=weights_dtype, device=device)
         return q, k, weights, topk_indices, topk_length
     else:
         lse = torch.randn(b, s_q, qhpkv, dtype=torch.float32, device=device)
@@ -84,6 +84,7 @@ def test_DSA_sparse_score_recompute_wrapper(
     head_dim,
     qhead_per_kv_head,
     score_type,
+    weights_dtype,
     has_topk_length,
     request,
 ):
@@ -109,7 +110,15 @@ def test_DSA_sparse_score_recompute_wrapper(
         cfg,
         score_type,
         has_topk_length=has_topk_length,
+        weights_dtype=weights_dtype,
     )
+    if weights_dtype == torch.float32:
+        q.zero_()[..., 0] = 1
+        k.zero_()[..., 0] = torch.arange(cfg["s_kv"], device=k.device).view(1, -1) / 128
+        aux.zero_()[..., 0] = 1 + 2**-10
+        # Keep duplicate slots and an interior sentinel in their original positions.
+        topk_indices[..., 1] = topk_indices[..., 0]
+        topk_indices[..., 3] = -1
     stream = cuda.CUstream(torch.cuda.current_stream().cuda_stream)
 
     try:
@@ -138,7 +147,17 @@ def test_DSA_sparse_score_recompute_wrapper(
             )
             actual = result["target"]
     except (ValueError, NotImplementedError, RuntimeError) as e:
+        if weights_dtype == torch.float32:
+            raise
         pytest.skip(f"Unsupported testcase: {e}")
+
+    if weights_dtype == torch.float32:
+        valid = topk_indices >= 0
+        if topk_length is not None:
+            valid &= torch.arange(topk_indices.shape[-1], device=q.device) < topk_length[..., None]
+        selected_k = torch.gather(k.double()[..., 0][:, None, :].expand(-1, cfg["s_q"], -1), 2, topk_indices.clamp_min(0).long())
+        expected = torch.softmax((selected_k * aux.double()[..., 0, None]).masked_fill(~valid, float("-inf")), dim=-1)
+        torch.testing.assert_close(actual.double(), expected, atol=1e-7, rtol=2e-5)
 
     if not cfg["skip_ref"]:
         if score_type == "indexer":
@@ -166,9 +185,16 @@ def test_DSA_sparse_score_recompute_wrapper(
 
 @pytest.mark.L0
 @torch_fork_set_rng(seed=1)
-@pytest.mark.parametrize("score_type", ["indexer", "attention"])
+@pytest.mark.parametrize(
+    "score_type,weights_dtype",
+    [
+        pytest.param("indexer", torch.bfloat16, id="indexer-bf16-w"),
+        pytest.param("indexer", torch.float32, id="indexer-fp32-w"),
+        pytest.param("attention", None, id="attention"),
+    ],
+)
 @pytest.mark.parametrize("has_topk_length", [False, True])
-def test_DSA_sparse_score_recompute_wrapper_batch_gt_one(score_type, has_topk_length, request):
+def test_DSA_sparse_score_recompute_wrapper_batch_gt_one(score_type, weights_dtype, has_topk_length, request):
     try:
         from cudnn import DSA
         from cuda.bindings import driver as cuda
@@ -193,6 +219,7 @@ def test_DSA_sparse_score_recompute_wrapper_batch_gt_one(score_type, has_topk_le
         cfg,
         score_type,
         has_topk_length=has_topk_length,
+        weights_dtype=weights_dtype,
     )
     stream = cuda.CUstream(torch.cuda.current_stream().cuda_stream)
 
@@ -226,6 +253,8 @@ def test_DSA_sparse_score_recompute_wrapper_batch_gt_one(score_type, has_topk_le
                 )
                 actual = result["target"]
         except (ValueError, NotImplementedError, RuntimeError) as e:
+            if weights_dtype == torch.float32:
+                raise
             pytest.skip(f"Unsupported testcase: {e}")
 
         if not cfg["skip_ref"]:

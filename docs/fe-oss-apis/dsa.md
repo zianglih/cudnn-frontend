@@ -301,8 +301,8 @@ compressed column 0.
     batch/THD segment, on the same device as `q`.
 - **Output** — `scores`: `(B, S_q, S_k)` FP32.
 - **Scope** — FP32 weights are supported by Indexer Forward and Combined
-  Indexer Forward + Top-K. The separate indexer score-recompute and backward
-  APIs still require BF16 weights.
+  Indexer Forward + Top-K. Indexer score recomputation and backward also accept
+  FP32 weights with BF16 Q/K, subject to the layout restrictions below.
 - **Precision paths**
   - SM90 `precision="fp8"`: Q/K use E4M3 and `q_scale`/`k_scale` are FP32
     descales with one value per token/head. Set `return_lse=True` (or provide
@@ -471,6 +471,10 @@ Computes softmax over top-K entries of the indexer score:
   default; pass `topk_indices_global=True` when using ids encoded as
   `batch_idx * S_k + local_idx`.
 - **Output** — `predict`: `(B, S_q, topk)` FP32.
+- **Weight precision** — BF16 Q/K accept BF16 or FP32 weights. FP32 mode
+  requires unit last strides for Q/K/W, contiguous INT32 indices and optional
+  lengths, and a contiguous output. The wrapper allocates an omitted output;
+  class execution requires a supplied output in FP32 mode.
 
 ### 7. Sparse Attn Score Recompute
 
@@ -490,6 +494,13 @@ Full-KV (no top-K) analogues of §6 and §7. Each returns `{'out', 'denom'}`.
 They apply the same ratio-causal mask as Indexer Forward; masked positions are
 written as `-inf` and excluded from `denom`. Pass the same `q_causal_offsets` to
 all dense score tensors that feed the same loss path.
+
+Dense indexer recomputation accepts BF16 or FP32 weights with BF16 Q/K.
+FP32 mode requires unit last strides for Q/K/W, contiguous supplied outputs,
+and contiguous INT32 causal offsets when provided. SM90 supports FP32 weights
+in BSHD only. SM100 THD requires explicit `max_seqlen_q` and `max_seqlen_k`
+to avoid reading device metadata on the host. FP32 class execution requires
+both output and denominator buffers; wrappers allocate omitted buffers.
 
 On SM100, Indexer Forward and Dense Indexer Score Recompute use the same
 unified kernel implementation: forward runs it with `compute_lse=False`, while
@@ -537,8 +548,11 @@ forward used `topk_indices_global=False`. The public sparse
 `indexer_backward_wrapper` has a
 BSHD-shaped interface; BF16 THD tensors can use zero-copy `B=1` views (squeeze
 the singleton K head and add a batch dimension) together with global Top-K
-indices. FP8 and MXFP8 indexer backward are not currently supported because
-the backward wrapper requires BF16 Q/K/W inputs.
+indices. The backward wrapper requires BF16 Q/K and accepts BF16 or FP32
+weights; FP8 and MXFP8 backward are not supported. `d_weights` independently
+accepts BF16 or FP32 buffers and defaults to the weights dtype. FP32 W and dW
+must be contiguous. The default backend still rounds its per-slot gradient
+matrix to BF16 before the dQ/dK GEMMs; FP32 W does not change that arithmetic.
 
 For the default SM100 backend, `topk_indices_global` describes the input
 encoding; it is not a performance-tuning switch. When Gather4 is available,
@@ -585,8 +599,9 @@ the complete wrapper on the target shape when those properties are required.
 - **Output dtype selects output precision** — `d_weights` and `d_index_k`
   accept FP32 buffers, which receive the fp32 accumulators directly; **the
   headline accuracy gains require caller-supplied FP32 buffers.** The default
-  wrapper-allocated outputs keep the input dtypes (BF16), which rounds the
-  extra accuracy back to the BF16 representation floor (~1.7e-3 relative).
+  wrapper-allocated outputs keep their corresponding input dtypes (BF16 Q/K,
+  BF16 or FP32 W). BF16 outputs round the extra accuracy back to the BF16
+  representation floor (~1.7e-3 relative).
   FP32 `d_index_k` is zeroed internally (no caller pre-zero contract).
   `d_index_q` is always BF16.
 - **Envelope** (validated by `check_support` when a plan is created, and
@@ -654,13 +669,16 @@ and denominators produced by Dense Indexer / Dense Attn Score Recompute.
 
 - **Inputs**
   - `index_q`: `(B, S_q, H, D)` BF16
-  - `weights`: `(B, S_q, H)` BF16
+  - `weights`: `(B, S_q, H)` BF16 or FP32
   - `index_k`: `(B, S_k, D)` BF16
   - `attn_score`, `index_score`: `(B, S_q, S_k)` FP32 raw dense scores
   - `attn_l1norm`, `index_lse`: `(B, S_q)` FP32 denominators
   - `q_causal_offsets` (optional): same offsets used for the corresponding
     Dense Indexer / Dense Attn Score Recompute outputs.
 - **Outputs** — `d_index_q`, `d_weights`, `d_index_k`
+  (`d_weights` independently accepts BF16 or FP32 and defaults to the weights
+  dtype). FP32 weights and `d_weights` require contiguous layouts. As in sparse
+  backward, the default dQ/dK path retains BF16 gradient-matrix rounding.
 - **Constraints** — SM90 or SM100+, `H >= 64`, `ratio >= 1`
 
 ```python

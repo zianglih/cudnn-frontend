@@ -33,7 +33,7 @@ def _require_exact_sm100():
         pytest.skip("backend='sm100_v2' requires an SM100 (10, 0) GPU")
 
 
-def _allocate(cfg, sm_scale: float):
+def _allocate(cfg, sm_scale: float, weights_dtype=torch.bfloat16):
     b = cfg["b"]
     s_q = cfg["s_q"]
     s_k = cfg["s_kv"]
@@ -43,7 +43,7 @@ def _allocate(cfg, sm_scale: float):
     device = "cuda"
 
     index_q = torch.randn(b, s_q, h, d, dtype=torch.bfloat16, device=device)
-    weights = torch.randn(b, s_q, h, dtype=torch.bfloat16, device=device)
+    weights = torch.randn(b, s_q, h, dtype=weights_dtype, device=device)
     index_k = torch.randn(b, s_k, d, dtype=torch.bfloat16, device=device)
 
     topk_k = min(topk, s_k)
@@ -82,12 +82,23 @@ def _allocate(cfg, sm_scale: float):
 @pytest.mark.L0
 @torch_fork_set_rng(seed=0)
 @with_dsa_indexer_backward_params
+@pytest.mark.parametrize(
+    "weights_dtype,d_weights_dtype",
+    [
+        pytest.param(torch.bfloat16, None, id="bf16-w-default-dw"),
+        pytest.param(torch.float32, None, id="fp32-w-default-dw"),
+        pytest.param(torch.bfloat16, torch.float32, id="bf16-w-fp32-dw"),
+        pytest.param(torch.float32, torch.bfloat16, id="fp32-w-bf16-dw"),
+    ],
+)
 def test_DSA_indexer_backward_wrapper(
     dtype,
     acc_dtype,
     head_dim,
     qhead_per_kv_head,
     block_I,
+    weights_dtype,
+    d_weights_dtype,
     request,
 ):
     try:
@@ -124,7 +135,7 @@ def test_DSA_indexer_backward_wrapper(
         attn_score,
         index_score,
         topk_indices,
-    ) = _allocate(cfg, sm_scale=sm_scale)
+    ) = _allocate(cfg, sm_scale=sm_scale, weights_dtype=weights_dtype)
     torch_stream = torch.cuda.Stream()
     stream = cuda.CUstream(torch_stream.cuda_stream)
 
@@ -146,9 +157,12 @@ def test_DSA_indexer_backward_wrapper(
             loss_coeff=loss_coeff,
             grad_loss=grad_loss,
             block_I=block_I,
+            d_weights=torch.empty_like(weights, dtype=d_weights_dtype) if d_weights_dtype is not None else None,
             stream=stream,
         )
     except (ValueError, NotImplementedError, RuntimeError) as e:
+        if weights_dtype == torch.float32 or d_weights_dtype == torch.float32:
+            raise
         pytest.skip(f"Unsupported testcase: {e}")
     torch_stream.synchronize()
 
@@ -160,6 +174,7 @@ def test_DSA_indexer_backward_wrapper(
 
     assert d_index_q.shape == index_q.shape
     assert d_weights.shape == weights.shape
+    assert d_weights.dtype == (d_weights_dtype or weights_dtype)
     assert d_index_k.shape == index_k.shape
     assert torch.isfinite(d_index_q.float()).all()
     assert torch.isfinite(d_weights.float()).all()
@@ -239,10 +254,6 @@ def test_DSA_indexer_backward_illegal_output_dtype_raises_before_mutation():
 
     for label, kw in (
         ("fp32 d_index_q", {"d_index_q_dtype": torch.float32}),
-        # fp32 d_weights is rejected: the kernel's dW store rounds the fp32
-        # accumulator to bf16, so an fp32 buffer cannot be produced faithfully
-        # and would silently carry bf16 precision.
-        ("fp32 d_weights", {"d_weights_dtype": torch.float32}),
         ("fp16 d_weights", {"d_weights_dtype": torch.float16}),
         ("fp16 d_index_k", {"d_index_k_dtype": torch.float16}),
     ):
@@ -374,6 +385,15 @@ def test_DSA_indexer_backward_direct_plan_shape_stride_mismatch_raises():
     torch.cuda.synchronize()
     assert torch.equal(aq3, aq3_pre), "attn_score mutated before the output-stride check (fail-dirty)"
     assert torch.equal(isc3, isc3_pre), "index_score mutated before the output-stride check (fail-dirty)"
+
+    # Legal W/dW dtypes still cannot replace a different compiled descriptor.
+    for runtime_w, runtime_dw in ((w.float(), torch.empty_like(w)), (w, torch.empty_like(w, dtype=torch.float32))):
+        aq4, isc4 = attn.clone(), idx.clone()
+        with pytest.raises(ValueError):
+            plan.execute(iq, runtime_w, ik, torch.empty_like(iq), runtime_dw, torch.empty_like(ik), aq4, isc4, tk, grad_loss, loss_coeff=loss_coeff)
+        torch.cuda.synchronize()
+        assert torch.equal(aq4, attn), "attn_score mutated before the dtype check"
+        assert torch.equal(isc4, idx), "index_score mutated before the dtype check"
 
 
 @pytest.mark.L0
@@ -1270,12 +1290,14 @@ def test_DSA_indexer_backward_wrapper_v2_sm_scale(
 @pytest.mark.L1
 @torch_fork_set_rng(seed=0)
 @with_dsa_indexer_backward_params
+@pytest.mark.parametrize("weights_dtype", [torch.bfloat16, torch.float32], ids=["bf16-w", "fp32-w"])
 def test_DSA_indexer_backward_wrapper_v2_fp32_outputs(
     dtype,
     acc_dtype,
     head_dim,
     qhead_per_kv_head,
     block_I,
+    weights_dtype,
     request,
 ):
     """fp32 d_weights / d_index_k output contract: caller-supplied fp32
@@ -1308,7 +1330,7 @@ def test_DSA_indexer_backward_wrapper_v2_fp32_outputs(
     loss_coeff = float(b * s_q)
     grad_loss = torch.ones((), dtype=torch.float32, device="cuda")
 
-    index_q, weights, index_k, attn_score, index_score, topk_indices = _allocate(cfg, sm_scale=sm_scale)
+    index_q, weights, index_k, attn_score, index_score, topk_indices = _allocate(cfg, sm_scale=sm_scale, weights_dtype=weights_dtype)
 
     def run_fp32():
         dw32 = torch.empty(b, s_q, cfg["qhead_per_kv_head"], dtype=torch.float32, device="cuda")
@@ -2449,10 +2471,12 @@ def test_DSA_indexer_backward_sm100_score_grad_pdl_full_pipeline_matches_serial(
         pytest.param(512, True, True, id="global-512-manual-k-load"),
     ],
 )
+@pytest.mark.parametrize("weights_dtype", [torch.bfloat16, torch.float32], ids=["bf16-w", "fp32-w"])
 def test_DSA_indexer_backward_sm100_persistent_short_topk_matches_reference(
     topk,
     topk_indices_global,
     force_manual_k_load,
+    weights_dtype,
     monkeypatch,
     request,
 ):
@@ -2477,7 +2501,7 @@ def test_DSA_indexer_backward_sm100_persistent_short_topk_matches_reference(
     sm_scale = head_dim**-0.5
     index_q = torch.randn((batch, seqlen_q, heads, head_dim), device=device, dtype=torch.bfloat16, generator=generator)
     index_k = torch.randn((batch, seqlen_k, head_dim), device=device, dtype=torch.bfloat16, generator=generator)
-    weights = torch.randn((batch, seqlen_q, heads), device=device, dtype=torch.bfloat16, generator=generator).abs().mul_(0.1)
+    weights = torch.randn((batch, seqlen_q, heads), device=device, dtype=weights_dtype, generator=generator).abs().mul_(0.1)
     local_ids = torch.randint(0, seqlen_k, (batch, seqlen_q, topk), device=device, dtype=torch.int32, generator=generator)
     local_ids[:, ::17, ::19] = -1
     valid = local_ids >= 0
@@ -2493,6 +2517,13 @@ def test_DSA_indexer_backward_sm100_persistent_short_topk_matches_reference(
     global_ids[0, 1, 3] = -1
     valid[0, 1, 3] = False
     grad_signal = torch.randn((batch, seqlen_q, topk), device=device, dtype=torch.float32, generator=generator)
+
+    if weights_dtype == torch.float32:
+        index_q.fill_(1)
+        index_k.fill_(1)
+        weights.fill_(1 + 2**-10)
+        grad_signal.fill_(1 + 3 * 2**-10)
+        sm_scale = 1.0
 
     d_index_q = torch.empty_like(index_q)
     d_weights = torch.empty_like(weights)
@@ -2511,18 +2542,21 @@ def test_DSA_indexer_backward_sm100_persistent_short_topk_matches_reference(
     kernel.gemm_only(index_q, weights, index_k, d_index_q, d_weights, d_index_k, grad_signal, kernel_ids)
     torch.cuda.synchronize()
 
+    ref_dtype = torch.float64 if weights_dtype == torch.float32 else torch.float32
     safe_ids = local_ids.clamp(min=0).long()
     selected_k = torch.gather(
         index_k[:, None].expand(-1, seqlen_q, -1, -1),
         2,
         safe_ids[..., None].expand(-1, -1, -1, head_dim),
-    ).float()
-    scores = torch.einsum("bqhd,bqtd->bqht", index_q.float(), selected_k) * sm_scale
-    d_scores = grad_signal[:, :, None, :] * weights.float()[:, :, :, None] * ((scores > 0) & valid[:, :, None, :])
+    ).to(ref_dtype)
+    scores = torch.einsum("bqhd,bqtd->bqht", index_q.to(ref_dtype), selected_k) * sm_scale
+    d_scores = grad_signal.to(ref_dtype)[:, :, None, :] * weights.to(ref_dtype)[:, :, :, None] * ((scores > 0) & valid[:, :, None, :])
+    if weights_dtype == torch.float32:
+        d_scores = d_scores.to(torch.bfloat16).double()
     d_index_q_ref = torch.einsum("bqht,bqtd->bqhd", d_scores, selected_k) * sm_scale
-    d_weights_ref = (grad_signal[:, :, None, :] * torch.relu(scores) * valid[:, :, None, :]).sum(dim=-1)
-    d_index_k_ref = torch.zeros_like(index_k, dtype=torch.float32)
-    d_index_k_contrib = torch.einsum("bqht,bqhd->bqtd", d_scores, index_q.float()) * sm_scale
+    d_weights_ref = (grad_signal.to(ref_dtype)[:, :, None, :] * torch.relu(scores) * valid[:, :, None, :]).sum(dim=-1)
+    d_index_k_ref = torch.zeros_like(index_k, dtype=ref_dtype)
+    d_index_k_contrib = torch.einsum("bqht,bqhd->bqtd", d_scores, index_q.to(ref_dtype)) * sm_scale
     d_index_k_ref.view(-1, head_dim).index_add_(
         0,
         global_ids.clamp(min=0).reshape(-1).long(),
@@ -2534,8 +2568,12 @@ def test_DSA_indexer_backward_sm100_persistent_short_topk_matches_reference(
         ("dW", d_weights.float(), d_weights_ref),
         ("dK", d_index_k, d_index_k_ref),
     ):
-        actual_flat = actual.flatten()
-        expected_flat = expected.flatten()
+        if weights_dtype == torch.float32:
+            if name == "dQ":
+                expected = expected.to(d_index_q.dtype)
+            torch.testing.assert_close(actual, expected.to(actual.dtype), atol=0, rtol=0, msg=lambda msg, name=name: f"{name}: {msg}")
+        actual_flat = actual.double().flatten()
+        expected_flat = expected.double().flatten()
         cosine = F.cosine_similarity(actual_flat, expected_flat, dim=0).item()
         rms_relative = ((actual_flat - expected_flat).square().mean().sqrt() / expected_flat.square().mean().sqrt().clamp_min(1e-12)).item()
         assert torch.isfinite(actual_flat).all(), f"{name} contains NaN/Inf"

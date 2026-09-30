@@ -40,6 +40,7 @@ from cudnn.deepseek_sparse_attention.utils.runtime import (
     validate_q_causal_offsets,
 )
 from .sparse_score_recompute_sm90 import SparseScoreRecomputeSm90
+from ._validation import validate_fp32_indexer_inputs
 from .dense_score_recompute_sm90 import DenseScoreRecomputeSm90
 from cudnn.deepseek_sparse_attention.utils.compiler import compile_options
 
@@ -89,7 +90,14 @@ def _validate_and_prepare_common(
     assert q.dtype in [torch.float16, torch.bfloat16], f"q dtype must be half precision, got {q.dtype}"
     assert q.dtype == kv.dtype, f"q/kv dtype mismatch: q={q.dtype}, kv={kv.dtype}"
     if is_index_scores:
-        assert weights_or_lse.dtype == q.dtype, f"weights must match q dtype (half precision): got {weights_or_lse.dtype} vs {q.dtype}"
+        assert weights_or_lse.dtype == q.dtype or (
+            q.dtype == torch.bfloat16 and weights_or_lse.dtype == torch.float32
+        ), f"weights must match Q dtype or be FP32 with BF16 Q/K, got {weights_or_lse.dtype} vs {q.dtype}"
+        if weights_or_lse.dtype == torch.float32:
+            # Public BSH weights arrive as a BHS view; the kernel consumes its strides.
+            validate_fp32_indexer_inputs(q, kv, weights_or_lse.transpose(1, 2))
+            assert all(t.is_cuda for t in (q, kv, weights_or_lse))
+            return q, kv, weights_or_lse
     else:
         assert weights_or_lse.dtype == torch.float32, f"lse must be float32, got {weights_or_lse.dtype}"
     assert all(t.is_cuda for t in (q, kv, weights_or_lse))
@@ -156,6 +164,7 @@ def _sparse_score_recompute(
 
     compile_key = (
         dtype,
+        weights_or_lse.dtype,
         head_dim,
         qhead_per_kvhead,
         tile_m,
@@ -180,7 +189,7 @@ def _sparse_score_recompute(
         topk_idxs_cute = to_cute_tensor(topk_indices)
         topk_length_cute = to_cute_tensor(topk_length) if topk_length is not None else None
         out_cute = to_cute_tensor(out)
-        weights_cute = to_cute_tensor(weights_or_lse)
+        weights_cute = to_cute_tensor(weights_or_lse, leading_dim=1 if is_index_scores and weights_or_lse.dtype == torch.float32 else -1)
 
         kernel_obj = SparseScoreRecomputeSm90(
             dtype,
@@ -250,9 +259,12 @@ def sparse_indexer_score_recompute(
     (preserves precision vs pre-multiplying onto bf16 weights on the host).
     Defaults to 1.0 (identity).
     """
+    validate_fp32_indexer_inputs(q_indexer, k_indexer, weights, topk_indices=topk_indices, topk_length=topk_length, out=out)
     kv = k_indexer.unsqueeze(2)
     with _torch_stream_context(current_stream):
-        w_bhs = weights.transpose(1, 2).contiguous()
+        w_bhs = weights.transpose(1, 2)
+        if weights.dtype != torch.float32:
+            w_bhs = w_bhs.contiguous()
     return _sparse_score_recompute(
         q_indexer,
         kv,
@@ -338,7 +350,7 @@ def _dense_score_recompute(
     # A transposed (B, 1, H) tensor is already contiguous, so contiguous()
     # leaves its (B, H, 1) sequence stride at H. Normalize that unused stride
     # in a view for the CuTe ABI, on both cache misses and cache hits.
-    if seqlen_q == 1:
+    if seqlen_q == 1 and not (is_index_scores and weights_or_lse.dtype == torch.float32):
         weights_or_lse = weights_or_lse.as_strided(weights_or_lse.shape, (*weights_or_lse.stride()[:-1], 1))
     assert num_head > num_head_kv and num_head % num_head_kv == 0, f"MQA required: num_head={num_head}, num_head_kv={num_head_kv}"
     qhead_per_kvhead = num_head // num_head_kv
@@ -367,6 +379,7 @@ def _dense_score_recompute(
 
     compile_key = (
         dtype,
+        weights_or_lse.dtype,
         head_dim,
         qhead_per_kvhead,
         tile_m,
@@ -389,7 +402,7 @@ def _dense_score_recompute(
         q_cute = to_cute_tensor(q)
         kv_cute = to_cute_tensor(kv)
         out_cute = to_cute_tensor(out)
-        weights_cute = to_cute_tensor(weights_or_lse)
+        weights_cute = to_cute_tensor(weights_or_lse, leading_dim=1 if is_index_scores and weights_or_lse.dtype == torch.float32 else -1)
         denom_cute = to_cute_tensor(denom_out)
         q_offsets_cute = to_cute_tensor(q_causal_offsets, assumed_align=4, leading_dim=0) if q_causal_offsets is not None else None
 
@@ -568,7 +581,10 @@ def dense_indexer_score_recompute(
     (preserves precision vs pre-multiplying onto bf16 weights on the host).
     Defaults to 1.0 (identity).
     """
+    validate_fp32_indexer_inputs(q_indexer, k_indexer, weights, out=out, denom_out=denom_out, q_causal_offsets=q_causal_offsets)
     if cu_seqlens_q is not None or cu_seqlens_k is not None:
+        if weights.dtype == torch.float32:
+            raise NotImplementedError("SM90 FP32 W dense score recompute does not support THD")
         if cu_seqlens_q is None or cu_seqlens_k is None:
             raise ValueError("THD requires both cu_seqlens_q and cu_seqlens_k")
         return _dense_score_recompute_varlen(
@@ -590,7 +606,9 @@ def dense_indexer_score_recompute(
             current_stream=current_stream,
         )
     with _torch_stream_context(current_stream):
-        w_bhs = weights.transpose(1, 2).contiguous()
+        w_bhs = weights.transpose(1, 2)
+        if weights.dtype != torch.float32:
+            w_bhs = w_bhs.contiguous()
     return _dense_score_recompute(
         q_indexer,
         k_indexer,

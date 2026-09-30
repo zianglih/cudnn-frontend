@@ -4,9 +4,6 @@
 import pytest
 import torch
 
-from cudnn.deepseek_sparse_attention.indexer_backward.dense_indexer_backward_sm100 import (
-    dense_indexer_backward_sm100,
-)
 from test_utils import torch_fork_set_rng
 
 from deepseek_sparse_attention.cutedsl.dsa_utils import dsa_init, with_dsa_dense_indexer_backward_params
@@ -17,7 +14,7 @@ from deepseek_sparse_attention.cutedsl.dsa_reference import (
 )
 
 
-def _allocate(cfg, sm_scale: float, ratio: int, q_causal_offsets: torch.Tensor):
+def _allocate(cfg, sm_scale: float, ratio: int, q_causal_offsets: torch.Tensor, weights_dtype=torch.bfloat16):
     b = cfg["b"]
     s_q = cfg["s_q"]
     s_k = cfg["s_kv"]
@@ -26,7 +23,7 @@ def _allocate(cfg, sm_scale: float, ratio: int, q_causal_offsets: torch.Tensor):
     device = "cuda"
 
     index_q = torch.randn(b, s_q, h, d, dtype=torch.bfloat16, device=device)
-    weights = torch.randn(b, s_q, h, dtype=torch.bfloat16, device=device)
+    weights = torch.randn(b, s_q, h, dtype=weights_dtype, device=device)
     index_k = torch.randn(b, s_k, d, dtype=torch.bfloat16, device=device)
 
     with torch.no_grad():
@@ -63,12 +60,23 @@ def _allocate(cfg, sm_scale: float, ratio: int, q_causal_offsets: torch.Tensor):
 @pytest.mark.L0
 @torch_fork_set_rng(seed=0)
 @with_dsa_dense_indexer_backward_params
+@pytest.mark.parametrize(
+    "weights_dtype,d_weights_dtype",
+    [
+        pytest.param(torch.bfloat16, None, id="bf16-w-default-dw"),
+        pytest.param(torch.float32, None, id="fp32-w-default-dw"),
+        pytest.param(torch.bfloat16, torch.float32, id="bf16-w-fp32-dw"),
+        pytest.param(torch.float32, torch.bfloat16, id="fp32-w-bf16-dw"),
+    ],
+)
 def test_DSA_dense_indexer_backward_wrapper(
     dtype,
     acc_dtype,
     head_dim,
     qhead_per_kv_head,
     block_I,
+    weights_dtype,
+    d_weights_dtype,
     ratio,
     request,
 ):
@@ -106,7 +114,7 @@ def test_DSA_dense_indexer_backward_wrapper(
         attn_l1norm,
         index_score,
         index_lse,
-    ) = _allocate(cfg, sm_scale=sm_scale, ratio=ratio, q_causal_offsets=q_causal_offsets)
+    ) = _allocate(cfg, sm_scale=sm_scale, ratio=ratio, q_causal_offsets=q_causal_offsets, weights_dtype=weights_dtype)
     torch_stream = torch.cuda.Stream()
     stream = cuda.CUstream(torch_stream.cuda_stream)
 
@@ -126,11 +134,14 @@ def test_DSA_dense_indexer_backward_wrapper(
             loss_coeff=loss_coeff,
             grad_loss=grad_loss,
             block_I=block_I,
+            d_weights=torch.empty_like(weights, dtype=d_weights_dtype) if d_weights_dtype is not None else None,
             ratio=ratio,
             q_causal_offsets=q_causal_offsets,
             stream=stream,
         )
     except (ValueError, NotImplementedError, RuntimeError) as e:
+        if weights_dtype == torch.float32 or d_weights_dtype == torch.float32:
+            raise
         pytest.skip(f"Unsupported testcase: {e}")
     torch_stream.synchronize()
 
@@ -140,6 +151,7 @@ def test_DSA_dense_indexer_backward_wrapper(
 
     assert d_index_q.shape == index_q.shape
     assert d_weights.shape == weights.shape
+    assert d_weights.dtype == (d_weights_dtype or weights_dtype)
     assert d_index_k.shape == index_k.shape
     assert torch.isfinite(d_index_q.float()).all()
     assert torch.isfinite(d_weights.float()).all()
@@ -164,7 +176,8 @@ def test_DSA_dense_indexer_backward_wrapper(
 
 @pytest.mark.L0
 @torch_fork_set_rng(seed=0)
-def test_DSA_dense_indexer_backward_cuda_graph():
+@pytest.mark.parametrize("weights_dtype", [torch.bfloat16, torch.float32], ids=["bf16-w", "fp32-w"])
+def test_DSA_dense_indexer_backward_cuda_graph(weights_dtype):
     if torch.cuda.get_device_capability()[0] < 9:
         pytest.skip("Dense indexer backward requires SM90+")
 
@@ -188,7 +201,7 @@ def test_DSA_dense_indexer_backward_cuda_graph():
         attn_l1norm,
         index_score,
         index_lse,
-    ) = _allocate(cfg, sm_scale=1.0, ratio=1, q_causal_offsets=None)
+    ) = _allocate(cfg, sm_scale=1.0, ratio=1, q_causal_offsets=None, weights_dtype=weights_dtype)
     attn_score_source = attn_score.clone()
     index_score_source = index_score.clone()
     d_index_q = torch.empty_like(index_q)
@@ -245,14 +258,20 @@ def test_DSA_dense_indexer_backward_cuda_graph():
 @pytest.mark.L0
 @pytest.mark.parametrize("head_dim", [64, 128])
 @pytest.mark.parametrize(("queries", "keys"), [(1, 1), (17, 31), (32, 128), (33, 129), (32, 513)])
-def test_DSA_dense_indexer_backward_staging_sync(queries: int, keys: int, head_dim: int) -> None:
-    if torch.cuda.get_device_capability()[0] < 10:
-        pytest.skip("Dense indexer SM100 staging test requires Blackwell+")
+@pytest.mark.parametrize("weights_dtype", [torch.bfloat16, torch.float32], ids=["bf16-w", "fp32-w"])
+def test_DSA_dense_indexer_backward_staging_sync(queries: int, keys: int, head_dim: int, weights_dtype) -> None:
+    capability = torch.cuda.get_device_capability()[0]
+    if capability < 9:
+        pytest.skip("Dense indexer backward requires SM90+")
+    if capability == 9:
+        from cudnn.deepseek_sparse_attention.indexer_backward.dense_indexer_backward_sm90 import dense_indexer_backward_sm90 as make_kernel
+    else:
+        from cudnn.deepseek_sparse_attention.indexer_backward.dense_indexer_backward_sm100 import dense_indexer_backward_sm100 as make_kernel
 
     query = torch.ones(queries, 64, head_dim, device="cuda", dtype=torch.bfloat16)
     key = torch.ones(keys, head_dim, device="cuda", dtype=query.dtype)
-    weights = torch.full(query.shape[:2], 0.01, device="cuda", dtype=query.dtype)
-    grad_signal = torch.full((queries, keys), 0.0001, device="cuda", dtype=torch.float32)
+    weights = torch.full(query.shape[:2], 1 + 2**-10, device="cuda", dtype=weights_dtype)
+    grad_signal = torch.full((queries, keys), 1 + 3 * 2**-10, device="cuda", dtype=torch.float32)
     grad_signal.masked_fill_(
         torch.arange(keys, device="cuda")[None, :] > torch.arange(queries, device="cuda")[:, None] + keys - queries,
         0,
@@ -263,7 +282,7 @@ def test_DSA_dense_indexer_backward_staging_sync(queries: int, keys: int, head_d
     query_grad = torch.empty_like(query)
     weights_grad = torch.empty_like(weights)
     key_grad = torch.zeros_like(key, dtype=torch.float32)
-    kernel = dense_indexer_backward_sm100(
+    kernel = make_kernel(
         1,
         queries,
         keys,
@@ -293,3 +312,13 @@ def test_DSA_dense_indexer_backward_staging_sync(queries: int, keys: int, head_d
             assert torch.isfinite(gradient).all(), f"Nonfinite {name}: {queries=}, {keys=}, {head_dim=}, {sign=}"
             if sign < 0:
                 assert torch.count_nonzero(gradient).item() == 0, f"Negative QK requires zero {name}: {queries=}, {keys=}, {head_dim=}"
+        if sign > 0:
+            # The GEMMs intentionally consume BF16 dS, after multiplying FP32 W.
+            # Narrowing W first gives 1.0 here instead of 1.0078125.
+            d_scores = (grad_signal.double() * weights.double()[:, :1]).to(torch.bfloat16).double()
+            expected_q = d_scores.sum(dim=1)[:, None, None].expand_as(query_grad).to(query_grad.dtype)
+            expected_k = (64 * d_scores.sum(dim=0))[:, None].expand_as(key_grad).to(key_grad.dtype)
+            expected_w = (head_dim * grad_signal.double().sum(dim=1))[:, None].expand_as(weights_grad).to(weights_grad.dtype)
+            torch.testing.assert_close(query_grad, expected_q, atol=0, rtol=0)
+            torch.testing.assert_close(key_grad, expected_k, atol=0, rtol=0)
+            torch.testing.assert_close(weights_grad, expected_w, atol=0, rtol=0)

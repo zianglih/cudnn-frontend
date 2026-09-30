@@ -157,7 +157,7 @@ def test_DSA_ratio_causal_mask_offsets_reference():
     assert torch.equal(_batched_ratio_causal_mask(5, 3, 4, device, 3, offsets), expected_batched)
 
 
-def _allocate(cfg, score_type: str):
+def _allocate(cfg, score_type: str, weights_dtype=torch.bfloat16):
     b = cfg["b"]
     s_q = cfg["s_q"]
     s_k = cfg["s_kv"]
@@ -169,7 +169,7 @@ def _allocate(cfg, score_type: str):
     q = torch.randn(b, s_q, h_kv * qhpkv, d, dtype=torch.bfloat16, device=device)
     k = torch.randn(b, s_k, h_kv, d, dtype=torch.bfloat16, device=device)
     if score_type == "indexer":
-        weights = torch.randn(b, s_q, h_kv * qhpkv, dtype=torch.bfloat16, device=device)
+        weights = torch.randn(b, s_q, h_kv * qhpkv, dtype=weights_dtype, device=device)
         return q, k, weights
     lse = torch.randn(b, s_q, h_kv * qhpkv, dtype=torch.float32, device=device)
     return q, k, lse
@@ -276,6 +276,7 @@ def test_DSA_dense_score_recompute_wrapper(
     head_dim,
     qhead_per_kv_head,
     score_type,
+    weights_dtype,
     request,
 ):
     try:
@@ -295,7 +296,12 @@ def test_DSA_dense_score_recompute_wrapper(
         s_q_default=256,
         s_kv_default=1024,
     )
-    q, k, aux = _allocate(cfg, score_type)
+    q, k, aux = _allocate(cfg, score_type, weights_dtype)
+    if weights_dtype == torch.float32:
+        # One active head/channel makes an exact oracle sensitive to a BF16 W cast.
+        q.zero_()[..., 0] = 1
+        k.zero_()[..., 0] = torch.arange(cfg["s_kv"], device=k.device).view(1, -1, 1) / 128
+        aux.zero_()[..., 0] = 1 + 2**-10
     q_causal_offsets = torch.full((cfg["b"],), 8, dtype=torch.int32, device=q.device)
     stream = cuda.CUstream(torch.cuda.current_stream().cuda_stream)
 
@@ -321,6 +327,8 @@ def test_DSA_dense_score_recompute_wrapper(
                 stream=stream,
             )
     except (ValueError, NotImplementedError, RuntimeError) as e:
+        if weights_dtype == torch.float32:
+            raise
         pytest.skip(f"Unsupported testcase: {e}")
 
     out = result["out"]
@@ -331,6 +339,13 @@ def test_DSA_dense_score_recompute_wrapper(
     assert torch.isfinite(out).any()
     assert (torch.isfinite(out) | torch.isneginf(out)).all()
     assert torch.isfinite(denom).all()
+
+    if weights_dtype == torch.float32:
+        expected = (aux.double()[..., 0, None] * k.double()[:, None, :, 0, 0]).masked_fill(
+            ~_batched_ratio_causal_mask(cfg["s_q"], cfg["s_kv"], 1, q.device, cfg["b"], q_causal_offsets), float("-inf")
+        )
+        torch.testing.assert_close(out.double(), expected, atol=2e-6, rtol=2e-6)
+        torch.testing.assert_close(denom.double(), torch.logsumexp(expected, dim=-1), atol=1e-5, rtol=2e-6)
 
     if not cfg["skip_ref"]:
         if score_type == "indexer":
