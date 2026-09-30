@@ -491,6 +491,8 @@ class DenseIndexerBackward2QGemmSm100:
 
         self.q_dtype = mQ.element_type
         self.k_dtype = mK.element_type
+        self.w_dtype = mW.element_type
+        self.dw_dtype = mdW.element_type
 
         # Layout transposes — sequence dim leading for TMA / per-batch views:
         #   BSHD Q  (B,S_q,H,D)  -> (H, D, S_q, B)     mode [2,3,1,0]
@@ -818,7 +820,7 @@ class DenseIndexerBackward2QGemmSm100:
             sGradSignal_q0_1: cute.struct.Align[cute.struct.MemRange[Float32, self.block_I], 128]
             sGradSignal_q1_0: cute.struct.Align[cute.struct.MemRange[Float32, self.block_I], 128]
             sGradSignal_q1_1: cute.struct.Align[cute.struct.MemRange[Float32, self.block_I], 128]
-            sW: cute.struct.Align[cute.struct.MemRange[self.q_dtype, self.heads * 2], 128]
+            sW: cute.struct.Align[cute.struct.MemRange[self.w_dtype, self.heads * 2], 128]
             sdK_reduce: cute.struct.Align[cute.struct.MemRange[Float32, self.block_I * self.head_dim_padded], 128]
 
         smem = SmemAllocator()
@@ -2049,11 +2051,11 @@ class DenseIndexerBackward2QGemmSm100:
             )
             if lane_id % 4 == 0:
                 h0 = warp_id_in_wg * 16 + lane_id // 4
-                mdW_b[q0_local, h0] = self.q_dtype(q0_sum_low)
-                mdW_b[q0_local, h0 + 8] = self.q_dtype(q0_sum_high)
+                mdW_b[q0_local, h0] = self.dw_dtype(q0_sum_low)
+                mdW_b[q0_local, h0 + 8] = self.dw_dtype(q0_sum_high)
                 if has_q1:
-                    mdW_b[q1_local, h0] = self.q_dtype(q1_sum_low)
-                    mdW_b[q1_local, h0 + 8] = self.q_dtype(q1_sum_high)
+                    mdW_b[q1_local, h0] = self.dw_dtype(q1_sum_low)
+                    mdW_b[q1_local, h0 + 8] = self.dw_dtype(q1_sum_high)
         else:
             # General-shape fallback: retain the complete native-coordinate
             # scan and full-warp reduction.
@@ -2067,7 +2069,7 @@ class DenseIndexerBackward2QGemmSm100:
                         q0_partial = q0_partial + dw_accum_q0[ei]
                 q0_total = cute.arch.warp_reduction_sum(q0_partial)
                 if lane_id == 0:
-                    mdW_b[q0_local, h] = self.q_dtype(q0_total)
+                    mdW_b[q0_local, h] = self.dw_dtype(q0_total)
 
             if has_q1:
                 for h_local in cutlass.range_constexpr(HEADS_PER_WARP):
@@ -2078,7 +2080,7 @@ class DenseIndexerBackward2QGemmSm100:
                             q1_partial = q1_partial + dw_accum_q1[ei]
                     q1_total = cute.arch.warp_reduction_sum(q1_partial)
                     if lane_id == 0:
-                        mdW_b[q1_local, h] = self.q_dtype(q1_total)
+                        mdW_b[q1_local, h] = self.dw_dtype(q1_total)
 
         # Ensure the final q0/q1 TMA store has completed before the CTA exits.
         dQ_store_pipeline.producer_tail()
@@ -2334,12 +2336,13 @@ def _build_cute_dsl_kernel(batch, max_seqlen_q, max_seqlen_k, heads, dim, sm_sca
         For BSHD (is_varlen=False) CuSeqlens* are None. For THD they are
         int32 cu_seqlens tensors of shape (B+1,).
         """
-        if compile_key not in _gemm_compile_cache:
+        gemm_key = (*compile_key, Weights.dtype, dWeights.dtype)
+        if gemm_key not in _gemm_compile_cache:
             s = _resolve_stream(current_stream)
             cuq_arg = to_cute_tensor(CuSeqlensQ) if CuSeqlensQ is not None else None
             cuk_arg = to_cute_tensor(CuSeqlensK) if CuSeqlensK is not None else None
             q_offsets_arg = to_cute_tensor(QCausalOffsets) if QCausalOffsets is not None else None
-            _gemm_compile_cache[compile_key] = cute.compile(
+            _gemm_compile_cache[gemm_key] = cute.compile(
                 gemm_obj,
                 to_cute_tensor(IndexQ),
                 to_cute_tensor(Weights),
@@ -2357,6 +2360,8 @@ def _build_cute_dsl_kernel(batch, max_seqlen_q, max_seqlen_k, heads, dim, sm_sca
                 s,
                 options=compile_options("--opt-level 3"),
             )
+
+        return _gemm_compile_cache[gemm_key]
 
     def _run_gemm_only(
         IndexQ,
@@ -2383,7 +2388,7 @@ def _build_cute_dsl_kernel(batch, max_seqlen_q, max_seqlen_k, heads, dim, sm_sca
         else:
             assert QCausalOffsets is None, "non-offset compiled kernel must not receive q_causal_offsets"
         s = _resolve_stream(current_stream)
-        _ensure_compiled_gemm(
+        kernel = _ensure_compiled_gemm(
             IndexQ,
             Weights,
             IndexK,
@@ -2397,7 +2402,7 @@ def _build_cute_dsl_kernel(batch, max_seqlen_q, max_seqlen_k, heads, dim, sm_sca
             current_stream=current_stream,
         )
         with torch.cuda.nvtx.range("indexer_backward_dsl_dense_gemm_2q"):
-            _gemm_compile_cache[compile_key](
+            kernel(
                 IndexQ,
                 Weights,
                 IndexK,

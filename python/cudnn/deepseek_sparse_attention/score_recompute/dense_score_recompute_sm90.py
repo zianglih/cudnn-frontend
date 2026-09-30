@@ -118,11 +118,8 @@ class DenseScoreRecomputeSm90:
         if const_expr(mQ_type not in [cutlass.Float16, cutlass.BFloat16]):
             raise TypeError("Only Float16 or BFloat16 is supported")
         if const_expr(self.is_index_scores):
-            if const_expr(not (mQ_type == weights_or_lse_type)):
-                raise TypeError("Q/KV and weights must have the same data type")
-        if const_expr(self.is_index_scores):
-            if const_expr(weights_or_lse_type not in [cutlass.Float16, cutlass.BFloat16]):
-                raise TypeError("Weight tensor must be half precision")
+            if const_expr(not (mQ_type == weights_or_lse_type or (mQ_type == cutlass.BFloat16 and weights_or_lse_type == cutlass.Float32))):
+                raise TypeError("Weights must match Q/KV dtype or be FP32 with BF16 Q/KV")
         if const_expr(not self.is_index_scores):
             if const_expr(weights_or_lse_type not in [cutlass.Float32]):
                 raise TypeError("LSE tensor must be float32")
@@ -232,7 +229,7 @@ class DenseScoreRecomputeSm90:
 
         mQ = _assume_strides(mQ)
         mKV = _assume_strides(mKV)
-        mWeights = _assume_strides(weights_or_lse)
+        mWeights = weights_or_lse if const_expr(self.is_index_scores and weights_or_lse.element_type == cutlass.Float32) else _assume_strides(weights_or_lse)
         mOut = _assume_strides(mOut)
         mL1NormDenom = _assume_strides(mL1NormDenom)  # always present on dense path
 
@@ -556,8 +553,7 @@ class DenseScoreRecomputeSm90:
 
                 if const_expr(self.is_index_scores):
                     _pack_gqa.load_Weights_packed_f32(
-                        mWeights_cur.iterator.toint(),
-                        seqlen_q_packed,
+                        mWeights_cur,
                         sWeights,
                         eff_m_block,
                         self.tile_m,
@@ -742,8 +738,7 @@ class DenseScoreRecomputeSm90:
 
                 if const_expr(self.is_index_scores):
                     _pack_gqa.load_Weights_packed_f32(
-                        mWeights_cur.iterator.toint(),
-                        seqlen_q_packed,
+                        mWeights_cur,
                         sWeights,
                         eff_m_block,
                         self.tile_m,

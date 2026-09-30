@@ -153,14 +153,9 @@ class SparseScoreRecomputeSm100:
         self.num_warps = 12
         self.threads_per_cta = self.WARP_SIZE * self.num_warps  # 384
         # Register allocation
-        # NOTE: num_regs_epilogue=256 accommodates pre-loading all per-head
-        # data (W/LSE) into registers before the n_block loop, which requires
-        # m_block_size BF16 (indexer) or m_block_size F32 (attention) extra regs.
-        # With m_block_size=qhead_per_kvhead=64, this needs 64 BF16=32 F32 regs
-        # (indexer) or 64 F32 regs (attention), fitting within 256. For
-        # qhead_per_kvhead=128, this would need 128 BF16=64 or 128 F32 regs,
-        # likely causing spills. In that case, fall back to the per-n_block
-        # autovec_copy pattern or use a chunked pre-load strategy.
+        # The 256-register epilogue budget includes preloaded BF16/FP32 W
+        # or FP32 LSE: 64 heads consume 32 or 64 registers respectively.
+        # Larger head counts can spill and need separate performance validation.
         self.num_regs_load = 48
         self.num_regs_mma = 48
         self.num_regs_epilogue = 256
@@ -305,7 +300,8 @@ class SparseScoreRecomputeSm100:
         mOut = cute.make_tensor(mOut.iterator, cute.select(mOut.layout, mode=[1, 2, 0]))
 
         # --- TopkLength layout: (bs, seqlen_q) -> (seqlen_q, bs) ---
-        mTopkLength = cute.make_tensor(mTopkLength.iterator, cute.select(mTopkLength.layout, mode=[1, 0]))
+        if const_expr(mTopkLength is not None):
+            mTopkLength = cute.make_tensor(mTopkLength.iterator, cute.select(mTopkLength.layout, mode=[1, 0]))
 
         # --- Grid and kernel dispatch (CLC persistent scheduling) ---
         seqlen_q_packed = cute.size(mQ.shape[0])
@@ -1248,7 +1244,7 @@ class SparseScoreRecomputeSm100:
         )
         W_src_f32 = cute.make_tensor(
             gW_f32_ptr,
-            cute.make_layout((self.m_block_size // 2,)),
+            cute.make_layout((self.m_block_size * self.per_head_dtype.width // Float32.width,)),
         )
 
         kv_offset = tScS[0][0]

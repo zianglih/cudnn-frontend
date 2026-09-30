@@ -204,6 +204,8 @@ class IndexerBackwardSm90:
         is_varlen = const_expr(self.is_dense and mCuSeqlensQ is not None)
         self.q_dtype = mQ.element_type
         self.k_dtype = mK.element_type
+        self.w_dtype = mW.element_type
+        self.dw_dtype = mdW.element_type
 
         # THD packed dense mode keeps tensors in their natural packed layout:
         #   Q/dQ: (T_q,H,D), K/dK: (T_k,D), W/dW/GradSignal: (T_q,*).
@@ -439,7 +441,7 @@ class IndexerBackwardSm90:
             sIndices0: cute.struct.Align[cute.struct.MemRange[Int32, self.block_I], 128]
             sIndices1: cute.struct.Align[cute.struct.MemRange[Int32, self.block_I], 128]
             sIndices2: cute.struct.Align[cute.struct.MemRange[Int32, self.block_I], 128]
-            sW: cute.struct.Align[cute.struct.MemRange[self.q_dtype, self.heads], 128]
+            sW: cute.struct.Align[cute.struct.MemRange[self.w_dtype, self.heads], 128]
             sDwPartial: cute.struct.Align[cute.struct.MemRange[Float32, self.heads_padded], 128]
             sdK_staging: cute.struct.Align[cute.struct.MemRange[Float32, self.dk_staging_elems], 128]
 
@@ -1048,7 +1050,7 @@ class IndexerBackwardSm90:
             for di in cutlass.range_constexpr(DW_PER_THREAD):
                 idx = di * self.TOTAL_COMPUTE_THREADS + tidx
                 if idx < self.heads:
-                    mdW[seq_idx, idx] = self.q_dtype(sDwPartial[idx])
+                    mdW[seq_idx, idx] = self.dw_dtype(sDwPartial[idx])
 
     # =========================================================================
     # Q (TMA) / grad_signal / weights cooperative loading (both compute WGs)
@@ -1618,7 +1620,7 @@ def _build_cute_dsl_kernel(
     # ``seqlen``/``seqlen_k``/``sm_scale`` are NOT keyed: they're forwarded as
     # runtime ``cutlass.Int32``/``Float32`` args below (seqlen* unused on the
     # sparse path).
-    compile_key = (heads, dim, topk, block_I, score_input_is_log, topk_indices_global)
+    compile_key_base = (heads, dim, topk, block_I, score_input_is_log, topk_indices_global)
 
     def _ensure_compiled(
         IndexQ,
@@ -1633,6 +1635,7 @@ def _build_cute_dsl_kernel(
     ):
         """Lazy-compile the GEMM kernel (kernel 2) on first execute (needs real tensors)."""
         s = _resolve_stream(current_stream)
+        compile_key = (*compile_key_base, Weights.dtype, dWeights.dtype)
         if compile_key not in _compile_cache:
             cute_args = [
                 to_cute_tensor(t)
@@ -1665,6 +1668,8 @@ def _build_cute_dsl_kernel(
                 options=compile_options(),
             )
 
+        return _compile_cache[compile_key]
+
     def _run_gemm_only(
         IndexQ,
         Weights,
@@ -1678,7 +1683,7 @@ def _build_cute_dsl_kernel(
     ):
         """Run only kernel 2 (GEMM). Caller must have run kernel 1 and zeroed dIndexK_f32."""
         s = _resolve_stream(current_stream)
-        _ensure_compiled(
+        kernel = _ensure_compiled(
             IndexQ,
             Weights,
             IndexK,
@@ -1689,7 +1694,7 @@ def _build_cute_dsl_kernel(
             TopkIndices,
             current_stream=current_stream,
         )
-        _compile_cache[compile_key](
+        kernel(
             IndexQ,
             Weights,
             IndexK,

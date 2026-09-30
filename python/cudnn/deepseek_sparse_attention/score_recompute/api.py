@@ -17,11 +17,12 @@ from typing import Optional
 import torch
 import cuda.bindings.driver as cuda
 
-from cudnn.deepseek_sparse_attention.utils.runtime import device_capability
+from cudnn.deepseek_sparse_attention.utils.runtime import device_capability, torch_stream_context
 
 from cudnn.api_base import APIBase, TupleDict
 
 from . import _interface_sm100 as _iface_sm100
+from ._validation import validate_fp32_indexer_inputs
 
 # ---------------------------------------------------------------------------
 # Base helpers
@@ -143,7 +144,7 @@ class SparseIndexerScoreRecompute(_ScoreRecomputeBase):
         self,
         sample_q_indexer: torch.Tensor,  # (B, S_q, H_q, D) BF16
         sample_k_indexer: torch.Tensor,  # (B, S_k, D) BF16 (MQA)
-        sample_weights: torch.Tensor,  # (B, S_q, H_q) BF16
+        sample_weights: torch.Tensor,  # (B, S_q, H_q) BF16/FP32
         sample_topk_indices: torch.Tensor,  # (B, S_q, topk) INT32
         sample_out: torch.Tensor,  # (B, S_q, topk) FP32
         sample_topk_length: Optional[torch.Tensor] = None,  # (B, S_q) INT32
@@ -164,7 +165,7 @@ class SparseIndexerScoreRecompute(_ScoreRecomputeBase):
         _check_score_arch(self)
         self._check_dtype(self.q_desc, torch.bfloat16, name="Q")
         self._check_dtype(self.k_desc, torch.bfloat16, name="K")
-        self._check_dtype(self.w_desc, torch.bfloat16, name="W")
+        self._check_dtype(self.w_desc, [torch.bfloat16, torch.float32], name="W")
         self._check_dtype(self.topk_desc, torch.int32, name="topk_indices")
         self._check_dtype(self.out_desc, torch.float32, name="out")
         _check_sparse_score_shapes(
@@ -178,6 +179,7 @@ class SparseIndexerScoreRecompute(_ScoreRecomputeBase):
             "W",
             self.qhead_per_kv_head,
         )
+        validate_fp32_indexer_inputs(self.q_desc, self.k_desc, self.w_desc, topk_indices=self.topk_desc, topk_length=self.topk_length_desc, out=self.out_desc)
         self._is_supported = True
         return True
 
@@ -191,6 +193,9 @@ class SparseIndexerScoreRecompute(_ScoreRecomputeBase):
         topk_length: Optional[torch.Tensor] = None,
         current_stream: Optional[cuda.CUstream] = None,
     ) -> torch.Tensor:
+        self._check_dtype(weights, self.w_desc.dtype, name="W")
+        if weights.dtype == torch.float32 and out is None:
+            raise ValueError("FP32 W execute requires a preallocated out")
         major, _ = device_capability()
         if major == 9:
             from . import _interface_sm90 as _iface_sm90
@@ -238,8 +243,13 @@ def sparse_indexer_score_recompute_wrapper(
     ``topk_indices_global=True`` when passing ids encoded as
     ``batch_idx * S_k + local_idx``.
     """
+    validate_fp32_indexer_inputs(q_indexer, k_indexer, weights, topk_indices=topk_indices, topk_length=topk_length, out=out)
+    if weights.dtype == torch.float32 and out is None:
+        with torch_stream_context(stream):
+            out = torch.empty(topk_indices.shape, dtype=torch.float32, device=q_indexer.device)
     key = (
         q_indexer.dtype,
+        weights.dtype,
         q_indexer.shape,
         k_indexer.shape,
         weights.shape,
@@ -505,7 +515,11 @@ def _dense_sample_shapes(
 
 
 class DenseIndexerScoreRecompute(_ScoreRecomputeBase):
-    """Dense indexer score recompute over full KV."""
+    """Dense indexer score recompute over full KV with BF16 Q/K and BF16/FP32 W.
+
+    FP32 W supports BSHD on SM90/SM100 and native THD on SM100 with explicit
+    max sequence lengths. Execute requires preallocated outputs.
+    """
 
     def __init__(
         self,
@@ -534,7 +548,7 @@ class DenseIndexerScoreRecompute(_ScoreRecomputeBase):
         _check_score_arch(self)
         self._check_dtype(self.q_desc, torch.bfloat16, name="Q")
         self._check_dtype(self.k_desc, torch.bfloat16, name="K")
-        self._check_dtype(self.w_desc, torch.bfloat16, name="W")
+        self._check_dtype(self.w_desc, [torch.bfloat16, torch.float32], name="W")
         self._check_dtype(self.out_desc, torch.float32, name="out")
         self._check_dtype(self.denom_desc, torch.float32, name="denom_out")
         self._value_error_if(self.ratio < 1, f"ratio must be >= 1, got {self.ratio}")
@@ -549,6 +563,9 @@ class DenseIndexerScoreRecompute(_ScoreRecomputeBase):
             self.is_thd,
             self.qhead_per_kv_head,
         )
+        validate_fp32_indexer_inputs(self.q_desc, self.k_desc, self.w_desc, out=self.out_desc, denom_out=self.denom_desc)
+        if self.w_desc.dtype == torch.float32 and self.is_thd and device_capability()[0] == 9:
+            raise NotImplementedError("SM90 FP32 W dense score recompute does not support THD")
         self._is_supported = True
         return True
 
@@ -568,6 +585,15 @@ class DenseIndexerScoreRecompute(_ScoreRecomputeBase):
         q_causal_offsets: Optional[torch.Tensor] = None,
         current_stream: Optional[cuda.CUstream] = None,
     ):
+        self._check_dtype(weights, self.w_desc.dtype, name="W")
+        if weights.dtype == torch.float32:
+            if out is None or denom_out is None:
+                raise ValueError("FP32 W execute requires preallocated out and denom_out")
+            if cu_seqlens_q is not None or cu_seqlens_k is not None:
+                if device_capability()[0] == 9:
+                    raise NotImplementedError("SM90 FP32 W dense score recompute does not support THD")
+                if max_seqlen_q is None or max_seqlen_k is None:
+                    raise ValueError("FP32 W THD requires max_seqlen_q and max_seqlen_k")
         scale = self.sm_scale if sm_scale is None else float(sm_scale)
         ratio_value = self.ratio if ratio is None else int(ratio)
         if cu_seqlens_q is not None:
@@ -637,6 +663,12 @@ def dense_indexer_score_recompute_wrapper(
     sf_vec_size: int = 32,
     stream: Optional[cuda.CUstream] = None,
 ) -> TupleDict:
+    validate_fp32_indexer_inputs(q, k, weights, out=out, denom_out=denom_out, q_causal_offsets=q_causal_offsets)
+    if weights.dtype == torch.float32 and (cu_seqlens_q is not None or cu_seqlens_k is not None):
+        if device_capability()[0] == 9:
+            raise NotImplementedError("SM90 FP32 W dense score recompute does not support THD")
+        if max_seqlen_q is None or max_seqlen_k is None:
+            raise ValueError("FP32 W THD requires max_seqlen_q and max_seqlen_k")
     is_thd, max_q, max_k, out_shape, denom_shape = _dense_sample_shapes(
         q,
         k,
@@ -673,8 +705,15 @@ def dense_indexer_score_recompute_wrapper(
             current_stream=stream,
         )
         return TupleDict(out=o, denom=d)
+    if weights.dtype == torch.float32:
+        with torch_stream_context(stream):
+            if out is None:
+                out = torch.empty(out_shape, dtype=torch.float32, device=q.device)
+            if denom_out is None:
+                denom_out = torch.empty(denom_shape, dtype=torch.float32, device=q.device)
     key = (
         q.dtype,
+        weights.dtype,
         q.shape,
         k.shape,
         weights.shape,

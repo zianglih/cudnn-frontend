@@ -298,7 +298,7 @@ def _build_cute_dsl_dense_kernel(
     # Compile caches are keyed only by params that change generated code. In
     # dense mode, K-block traversal is runtime-sized by seqlen_k.
     score_grad_key = (is_varlen, ratio, block_I, bool(has_q_causal_offsets))
-    gemm_key = (is_varlen, heads, dim, block_I, ratio, bool(has_q_causal_offsets))
+    gemm_key_base = (is_varlen, heads, dim, block_I, ratio, bool(has_q_causal_offsets))
     # mTopkIdx is a sparse-only slot (the kernel reads it under const_expr(not is_dense));
     # dense mode passes None at compile and at launch, never a dummy tensor (Rule 8).
 
@@ -316,6 +316,7 @@ def _build_cute_dsl_dense_kernel(
         current_stream=None,
     ):
         s = _resolve_stream(current_stream)
+        gemm_key = (*gemm_key_base, Weights.dtype, dWeights.dtype)
         if gemm_key not in _dense_compile_cache:
             cuq_arg = to_cute_tensor(CuSeqlensQ) if CuSeqlensQ is not None else None
             cuk_arg = to_cute_tensor(CuSeqlensK) if CuSeqlensK is not None else None
@@ -345,6 +346,8 @@ def _build_cute_dsl_dense_kernel(
                 q_offsets_arg,
                 options=compile_options(),
             )
+
+        return _dense_compile_cache[gemm_key]
 
     def _ensure_compiled_score_grad(
         IdxScoreRaw,
@@ -454,7 +457,7 @@ def _build_cute_dsl_dense_kernel(
             assert QCausalOffsets is None, "non-offset compiled kernel must not receive q_causal_offsets"
         s = _resolve_stream(current_stream)
 
-        _ensure_compiled(
+        kernel = _ensure_compiled(
             IndexQ,
             Weights,
             IndexK,
@@ -467,7 +470,7 @@ def _build_cute_dsl_dense_kernel(
             QCausalOffsets,
             current_stream=current_stream,
         )
-        _dense_compile_cache[gemm_key](
+        kernel(
             IndexQ,
             Weights,
             IndexK,

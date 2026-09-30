@@ -24,6 +24,7 @@ import cutlass.cute as cute
 import cuda.bindings.driver as cuda
 
 from .sparse_score_recompute_sm100 import SparseScoreRecomputeSm100
+from ._validation import validate_fp32_indexer_inputs
 from .dense_score_recompute_sm100 import DenseScoreRecomputeSm100
 from .dense_score_recompute_sm100_mxfp8 import BwdDenseAttnScoreSm100Mxfp8
 from .indexer_score_unified_sm100 import IndexerScoreUnifiedSm100
@@ -162,7 +163,7 @@ def _sparse_indexer_score_recompute(
     Args:
         q_indexer: (bs, seqlen_q, n_heads_q, head_dim) [BF16]
         k_indexer: (bs, seqlen_k, head_dim) [BF16] — no head dim (MQA)
-        weights: (bs, seqlen_q, n_heads_q) [BF16]
+        weights: (bs, seqlen_q, n_heads_q) [BF16/FP32]
         topk_indices: (bs, seqlen_q, topk) [INT32]
         qhead_per_kv_head: auto inferred if None
         out: optional output tensor (bs, seqlen_q, topk) [FP32]
@@ -172,6 +173,7 @@ def _sparse_indexer_score_recompute(
     Returns:
         predict: (bs, seqlen_q, topk) [FP32] — softmax of sparse index scores
     """
+    validate_fp32_indexer_inputs(q_indexer, k_indexer, weights, topk_indices=topk_indices, topk_length=topk_length, out=out)
     current_stream = _resolve_stream(current_stream)
     q_indexer, k_indexer, weights = [maybe_contiguous(t, current_stream) for t in (q_indexer, k_indexer, weights)]
     with _torch_stream_context(current_stream):
@@ -190,10 +192,10 @@ def _sparse_indexer_score_recompute(
     device = q_indexer.device
     have_topk_length = topk_length is not None
 
-    if topk_length is None:
+    if topk_length is None and weights.dtype != torch.float32:
         with _torch_stream_context(current_stream):
             topk_length = torch.empty((1, 1), dtype=torch.int32, device=device)
-    else:
+    elif topk_length is not None:
         with _torch_stream_context(current_stream):
             topk_length = topk_length.to(torch.int32).contiguous()
 
@@ -206,7 +208,7 @@ def _sparse_indexer_score_recompute(
     sK_per_stage = n_block_size * head_dim_padded * 2  # BF16
     sQ_size = m_block_size * head_dim_padded * 2  # BF16
     sTopkIdx_bytes = topk * 2 * 4  # double-buffer, INT32
-    sPerHead_bytes = m_block_size * 2 * 2  # double-buffer, BF16
+    sPerHead_bytes = m_block_size * 2 * weights.element_size()  # double-buffer
     smem_fixed = sPerHead_bytes + 2048  # barriers, sScoreAll, alignment
 
     topk_in_smem = True
@@ -234,6 +236,7 @@ def _sparse_indexer_score_recompute(
         compile_key = (
             "indexer",
             q_indexer.dtype,
+            weights.dtype,
             head_dim,
             qhead_per_kv_head,
             topk,
@@ -251,7 +254,7 @@ def _sparse_indexer_score_recompute(
             w_cute = to_cute_tensor(weights)
             topk_cute = to_cute_tensor(topk_indices)
             out_cute = to_cute_tensor(out)
-            topk_length_cute = to_cute_tensor(topk_length)
+            topk_length_cute = to_cute_tensor(topk_length) if topk_length is not None else None
 
             kernel_obj = SparseScoreRecomputeSm100(
                 head_dim=head_dim,
@@ -326,7 +329,7 @@ def sparse_indexer_score_recompute(
     Args:
         q_indexer: (bs, seqlen_q, n_heads_q, head_dim) [BF16]
         k_indexer: (bs, seqlen_k, head_dim) [BF16]
-        weights: (bs, seqlen_q, n_heads_q) [BF16]
+        weights: (bs, seqlen_q, n_heads_q) [BF16/FP32]
         topk_indices: (bs, seqlen_q, topk) [INT32]
         qhead_per_kv_head: auto inferred if None
         out: pre-allocated output (bs, seqlen_q, topk) [FP32], optional
@@ -822,14 +825,14 @@ def _dense_indexer_score_recompute(
     BSHD layout (default):
         q: (bs, seqlen_q, n_heads_q, head_dim) [BF16]
         k: (bs, seqlen_k, n_heads_kv, head_dim) [BF16]
-        weights: (bs, seqlen_q, n_heads_q) [BF16]
+        weights: (bs, seqlen_q, n_heads_q) [BF16/FP32]
         out: optional (bs, seqlen_q, seqlen_k) [FP32]
         denom_out: optional (bs, seqlen_q) [FP32] — LogSumExp denom
 
     THD layout (when cu_seqlens_q/k supplied):
         q: (total_q, n_heads_q, head_dim) [BF16]
         k: (total_k, n_heads_kv, head_dim) [BF16]
-        weights: (total_q, n_heads_q) [BF16]
+        weights: (total_q, n_heads_q) [BF16/FP32]
         out: optional (total_q, max_seqlen_k) [FP32]
         denom_out: optional (total_q,) [FP32]
 
@@ -840,6 +843,7 @@ def _dense_indexer_score_recompute(
     Returns:
         (out, denom_out)
     """
+    validate_fp32_indexer_inputs(q, k, weights, out=out, denom_out=denom_out, q_causal_offsets=q_causal_offsets)
     current_stream = _resolve_stream(current_stream)
     q, k, weights = [maybe_contiguous(t, current_stream) for t in (q, k, weights)]
     q_scale = maybe_contiguous(q_scale, current_stream)
@@ -929,8 +933,8 @@ def _dense_indexer_score_recompute(
             denom_out = torch.empty(denom_shape, dtype=torch.float32, device=device)
     head_dim_padded = int(math.ceil(head_dim / 16) * 16)
     if k_block_size is None:
-        k_block_size = _select_dense_k_block_size(head_dim_padded, m_block_size, n_block_size, per_head_elem_bytes=2)
-    kv_stage = _compute_dense_kv_stage(head_dim_padded, m_block_size, n_block_size, k_block_size, per_head_elem_bytes=2)
+        k_block_size = _select_dense_k_block_size(head_dim_padded, m_block_size, n_block_size, per_head_elem_bytes=weights.element_size())
+    kv_stage = _compute_dense_kv_stage(head_dim_padded, m_block_size, n_block_size, k_block_size, per_head_elem_bytes=weights.element_size())
     if precision == "mxfp8":
         # K-SMEM = n_block * k_block_size(=64) * kv_stage (fp8); 24 fits the
         # SM100 SMEM budget. k_block is locked to 64 above, so this is constant.
@@ -965,6 +969,7 @@ def _dense_indexer_score_recompute(
     else:
         base_compile_key = (
             q.dtype,
+            weights.dtype,
             head_dim,
             qhead_per_kv_head,
             m_block_size,

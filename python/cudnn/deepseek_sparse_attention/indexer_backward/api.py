@@ -214,10 +214,10 @@ class IndexerBackward(APIBase):
     def __init__(
         self,
         sample_index_q: torch.Tensor,  # (B, S_q, H, D) BF16
-        sample_weights: torch.Tensor,  # (B, S_q, H) BF16
+        sample_weights: torch.Tensor,  # (B, S_q, H) BF16 or FP32
         sample_index_k: torch.Tensor,  # (B, S_k, D) BF16
         sample_d_index_q: torch.Tensor,  # (B, S_q, H, D); same shape/dtype as index_q (bf16)
-        sample_d_weights: torch.Tensor,  # (B, S_q, H); bf16 (the default kernel's dW store rounds to bf16), or fp32 with backend="sm100_v2" (receives the fp32 accumulator directly)
+        sample_d_weights: torch.Tensor,  # (B, S_q, H); BF16 or FP32, independently of weights
         sample_d_index_k: torch.Tensor,  # (B, S_k, D); bf16 or fp32 (both arches; with backend="sm100_v2" fp32 receives the fp32 accumulator directly)
         sample_attn_score: torch.Tensor,  # (B, S_q, topk) FP32 — target
         sample_index_score: torch.Tensor,  # (B, S_q, topk) FP32 — predict
@@ -323,6 +323,8 @@ class IndexerBackward(APIBase):
             _require_shape(desc, name, expected)
         for desc, name, _ in checks:
             if not desc.is_contiguous():
+                if name in ("weights", "d_weights") and desc.dtype == torch.float32:
+                    raise NotImplementedError(f"FP32 {name} requires contiguous layout, got strides {tuple(desc.stride)}")
                 raise ValueError(
                     f"IndexerBackward requires contiguous (compact row-major) tensors; {name} has shape "
                     f"{tuple(desc.shape)} with non-compact stride {tuple(desc.stride)}. The kernel addresses "
@@ -400,6 +402,8 @@ class IndexerBackward(APIBase):
                 ("topk_indices", self.topk_desc),
             )
             for name, desc in all_descs:
+                if name in ("weights", "d_weights") and desc.dtype == torch.float32 and not desc.is_contiguous():
+                    raise NotImplementedError(f"FP32 {name} requires contiguous layout, got strides {tuple(desc.stride)}")
                 self._value_error_if(
                     not desc.is_contiguous(),
                     f"backend='sm100_v2' requires contiguous tensors: {name} has shape {tuple(desc.shape)} with stride {tuple(desc.stride)}",
@@ -409,30 +413,22 @@ class IndexerBackward(APIBase):
                     f"backend='sm100_v2' requires all tensors on one device: {name} is on {desc.device}, index_q on {self.iq_desc.device}",
                 )
         self._check_dtype(self.iq_desc, torch.bfloat16, name="index_q")
-        self._check_dtype(self.w_desc, torch.bfloat16, name="weights")
+        self._check_dtype(self.w_desc, [torch.bfloat16, torch.float32], name="weights")
         self._check_dtype(self.ik_desc, torch.bfloat16, name="index_k")
         self._check_dtype(self.attn_desc, torch.float32, name="attn_score")
         self._check_dtype(self.idx_score_desc, torch.float32, name="index_score")
         self._check_dtype(self.topk_desc, torch.int32, name="topk_indices")
-        # Output-dtype contract, validated here — before compile()/execute(),
-        # i.e. before kernel 1 overwrites ``attn_score`` (``index_score`` is
-        # read-only; no fail-dirty on a bad output dtype). ``d_index_q`` is
-        # bf16-only (TMA store of the input dtype). ``d_index_k`` accepts bf16 or fp32 on both
-        # arches (the GEMM accumulates dK in fp32; a bf16 buffer gets a
-        # trailing cast). ``d_weights`` is bf16-only on the default backend:
-        # its kernel's dW store rounds the fp32 accumulator to bf16, so an
-        # fp32 buffer cannot be produced faithfully and is rejected rather
-        # than silently filled with bf16-precision values. The sm100_v2
-        # branch above validates its own output-dtype matrix instead (fp32
-        # ``d_weights`` / ``d_index_k`` buffers receive the fp32 accumulators
-        # directly).
+        # Validate output dtypes before kernel 1 overwrites ``attn_score``.
+        # dQ remains BF16. dW stores its FP32 accumulator in the declared
+        # output dtype; dK uses an FP32 accumulator with a trailing cast only
+        # for BF16 output buffers.
         if not self.use_v2:
             self._check_dtype(self.diq_desc, torch.bfloat16, name="d_index_q")
             self._check_dtype(
                 self.dw_desc,
-                torch.bfloat16,
+                [torch.bfloat16, torch.float32],
                 name="d_weights",
-                extra_error_msg="the kernel's dW store rounds to bf16; fp32 output is not supported",
+                extra_error_msg="fp32 buffers receive the fp32 accumulator directly",
             )
             self._check_dtype(
                 self.dik_desc,
@@ -675,15 +671,19 @@ class DenseIndexerBackward(APIBase):
             f"DenseIndexerBackward requires SM90 or SM100+, found SM{major}",
         )
         self._check_dtype(self.iq_desc, torch.bfloat16, name="index_q")
-        self._check_dtype(self.w_desc, torch.bfloat16, name="weights")
+        self._check_dtype(self.w_desc, [torch.bfloat16, torch.float32], name="weights")
         self._check_dtype(self.ik_desc, torch.bfloat16, name="index_k")
         self._check_dtype(self.diq_desc, torch.bfloat16, name="d_index_q")
-        self._check_dtype(self.dw_desc, torch.bfloat16, name="d_weights")
+        self._check_dtype(self.dw_desc, [torch.bfloat16, torch.float32], name="d_weights")
         self._check_dtype(self.dik_desc, [torch.bfloat16, torch.float32], name="d_index_k")
         self._check_dtype(self.attn_desc, torch.float32, name="attn_score")
         self._check_dtype(self.attn_denom_desc, torch.float32, name="attn_l1norm")
         self._check_dtype(self.idx_score_desc, torch.float32, name="index_score")
         self._check_dtype(self.idx_lse_desc, torch.float32, name="index_lse")
+        for name, desc in (("weights", self.w_desc), ("d_weights", self.dw_desc)):
+            self._check_tensor_shape(desc, self.iq_desc.shape[:-1], name=name)
+            if desc.dtype == torch.float32 and not desc.is_contiguous():
+                raise NotImplementedError(f"FP32 {name} requires contiguous layout, got strides {tuple(desc.stride)}")
         self._value_error_if(self.block_I <= 0, f"block_I must be positive, got {self.block_I}")
         self._value_error_if(self.ratio < 1, f"ratio must be >= 1, got {self.ratio}")
         self._value_error_if(self.heads < 64, f"DenseIndexerBackward requires heads >= 64, got {self.heads}")
@@ -728,6 +728,13 @@ class DenseIndexerBackward(APIBase):
         q_causal_offsets: Optional[torch.Tensor] = None,
         current_stream: Optional[cuda.CUstream] = None,
     ) -> None:
+        # W and dW dtypes specialize the GEMM; reject a mismatched direct-plan
+        # invocation before zeroing dK or overwriting either score buffer.
+        for tensor, desc, name in ((weights, self.w_desc, "weights"), (d_weights, self.dw_desc, "d_weights")):
+            self._check_dtype(tensor, desc.dtype, name=name)
+            self._check_tensor_shape(tensor, desc.shape, name=name)
+            if tensor.dtype == torch.float32 and not tensor.is_contiguous():
+                raise NotImplementedError(f"FP32 {name} requires contiguous layout, got strides {tuple(tensor.stride())}")
         with _torch_stream_context(current_stream):
             grad_loss_tensor = _validate_grad_loss_tensor(grad_loss, index_q.device)
             grad_scale = float(loss_coeff) / max(int(self.normalization_tokens), 1)
@@ -835,9 +842,9 @@ def indexer_backward_wrapper(
             precision follows the buffers you pass: supply **fp32
             ``d_weights`` / ``d_index_k`` buffers to receive the fp32
             accumulators directly (required for the headline accuracy
-            gains)**; the default wrapper-allocated buffers keep the input
-            dtypes (bf16), which rounds the extra accuracy back to the bf16
-            representation floor. fp32 ``d_index_k`` is zeroed internally.
+            gains)**; wrapper-allocated buffers keep their corresponding
+            input dtypes (BF16 Q/K, BF16 or FP32 weights). BF16 outputs round
+            to the BF16 representation floor. fp32 ``d_index_k`` is zeroed internally.
             The backend owns a per-plan workspace (the dynamic-ticket
             counter; a bf16 ``d_index_k`` additionally takes a
             ``B * S_k * D`` fp32 accumulator from the caching allocator on
@@ -1012,6 +1019,12 @@ def dense_indexer_backward_wrapper(
     device as ``index_q``. The kernel reads its value at runtime, including on
     CUDA Graph replay.
     """
+    # Newly supported FP32 weights must use the kernels' native compact
+    # layout, rather than inheriting the legacy BF16 normalization copies.
+    if weights.dtype == torch.float32 and not weights.is_contiguous():
+        raise NotImplementedError(f"FP32 weights requires contiguous layout, got strides {tuple(weights.stride())}")
+    if d_weights is not None and d_weights.dtype == torch.float32 and not d_weights.is_contiguous():
+        raise NotImplementedError(f"FP32 d_weights requires contiguous layout, got strides {tuple(d_weights.stride())}")
     current_stream = stream  # the SM90 closures take the caller's stream too (Rule 5)
 
     with _torch_stream_context(current_stream):
@@ -1068,6 +1081,7 @@ def dense_indexer_backward_wrapper(
         index_q.dtype,
         weights.dtype,
         index_k.dtype,
+        d_weights.dtype,
         d_index_k.dtype,
         is_thd,
         batch,

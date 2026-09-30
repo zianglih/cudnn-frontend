@@ -71,7 +71,14 @@ DSA_INDEXER_TOP_K_PARAM_MARKS = [
 DSA_SCORE_RECOMPUTE_PARAM_MARKS = [
     pytest.mark.parametrize("head_dim", [128]),
     pytest.mark.parametrize("qhead_per_kv_head", [32]),
-    pytest.mark.parametrize("score_type", ["indexer", "attention"]),
+    pytest.mark.parametrize(
+        "score_type,weights_dtype",
+        [
+            pytest.param("indexer", torch.bfloat16, id="indexer-bf16-w"),
+            pytest.param("indexer", torch.float32, id="indexer-fp32-w"),
+            pytest.param("attention", None, id="attention"),
+        ],
+    ),
 ]
 
 DSA_SPARSE_SCORE_RECOMPUTE_PARAM_MARKS = [

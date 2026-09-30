@@ -406,7 +406,7 @@ class IndexerBackwardV2Sm100:
         self,
         mQ: cute.Tensor,  # (S, H, D) bf16
         mK: cute.Tensor,  # (SK, D) bf16
-        mW: cute.Tensor,  # (S, H) bf16 (upcast to fp32 in-register, exact)
+        mW: cute.Tensor,  # (S, H) BF16 or FP32 (retained as FP32 in-register)
         mIdx: cute.Tensor,  # (S, topk) int32
         mG: cute.Tensor,  # (S, topk) fp32
         mdQ: cute.Tensor,  # (S, H, D) bf16 out
@@ -512,7 +512,7 @@ class IndexerBackwardV2Sm100:
         tma_atom_Q: cute.CopyAtom,
         tma_tensor_Q: cute.Tensor,
         mK: cute.Tensor,  # (SK, D) bf16
-        mW: cute.Tensor,  # (S, H) bf16
+        mW: cute.Tensor,  # (S, H) BF16 or FP32
         mIdx: cute.Tensor,  # (S, topk) int32
         mG: cute.Tensor,  # (S, topk) fp32
         mdQ: cute.Tensor,  # (S, H, D) bf16
@@ -960,7 +960,7 @@ class IndexerBackwardV2Sm100:
             dq_cons = pipeline.make_pipeline_state(pipeline.PipelineUserType.Consumer, 1)
 
             rW = cute.make_rmem_tensor((self.num_heads,), Float32)
-            rWb = cute.make_rmem_tensor((self.num_heads,), BFloat16)
+            rW_input = cute.make_rmem_tensor((self.num_heads,), mW.element_type)
             rdW = cute.make_rmem_tensor((self.num_heads,), Float32)
             # A row buffers, chunked (8, 8) for 16B vector STS
             rAhi = cute.make_rmem_tensor((8, 8), BFloat16)
@@ -986,20 +986,18 @@ class IndexerBackwardV2Sm100:
                 if pe_ok:
                     # rW straight from gmem (mW is a read-only input; a smem
                     # stage + barrier would put this warpgroup on the restage
-                    # critical path). The row is loaded bf16 (16B vectors)
-                    # and upcast to fp32 in-register — bf16 -> fp32 is exact,
-                    # so this is bit-for-bit the fp32 view of mW without
-                    # needing a per-execute upcast kernel and buffer.
+                    # critical path). Load the declared W dtype in 16B vectors
+                    # and retain FP32 precision without a conversion kernel.
                     pe_wptr = cute.make_ptr(
-                        BFloat16,
+                        mW.element_type,
                         mW[pe_rowi, None].iterator.llvm_ptr,
                         cute.AddressSpace.gmem,
                         assumed_align=16,
                     )
                     pe_wrow = cute.make_tensor(pe_wptr, cute.make_layout((self.num_heads,)))
-                    cute.autovec_copy(pe_wrow, rWb)
+                    cute.autovec_copy(pe_wrow, rW_input)
                     for h in cutlass.range(self.num_heads, unroll_full=True):
-                        rW[h] = Float32(rWb[h])
+                        rW[h] = Float32(rW_input[h])
                         rdW[h] = Float32(0.0)
 
                     # rolled tile loop: the inner per-head-pair loop stays
@@ -1703,8 +1701,8 @@ def indexer_backward_v2_sm100(
         _check(dWeights.dtype == dw_out_dtype, f"d_weights dtype {dWeights.dtype} does not match the compiled plan ({dw_out_dtype})")
         _check(dIndexK.dtype in (torch.float32, torch.bfloat16), f"d_index_k must be float32 or bfloat16 (got {dIndexK.dtype})")
         _check(
-            IndexQ.dtype == torch.bfloat16 and Weights.dtype == torch.bfloat16 and IndexK.dtype == torch.bfloat16,
-            f"index_q/weights/index_k must be bfloat16 (got {IndexQ.dtype}/{Weights.dtype}/{IndexK.dtype})",
+            IndexQ.dtype == torch.bfloat16 and Weights.dtype in (torch.bfloat16, torch.float32) and IndexK.dtype == torch.bfloat16,
+            f"index_q/index_k must be bfloat16 and weights bfloat16 or float32 (got {IndexQ.dtype}/{Weights.dtype}/{IndexK.dtype})",
         )
         _check(TopkIndices.dtype == torch.int32, f"topk_indices must be int32 (got {TopkIndices.dtype})")
         for name, t in (
@@ -1778,7 +1776,7 @@ def indexer_backward_v2_sm100(
         ring_depth = 4
 
         s = _resolve_stream(current_stream)
-        compile_key = (heads, dim, topk, num_ctas, ticket_slots, ring_depth, dw_out_dtype, idx_local)
+        compile_key = (heads, dim, topk, num_ctas, ticket_slots, ring_depth, Weights.dtype, dw_out_dtype, idx_local)
         fn = _compile_cache.get(compile_key)
         if fn is None:
             kernel_obj = IndexerBackwardV2Sm100(
